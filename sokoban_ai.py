@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _ckpt
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 T0 = time.time()
 
 # Directions: 0=Up(-1,0), 1=Down(+1,0), 2=Left(0,-1), 3=Right(0,+1)
@@ -1506,7 +1506,7 @@ def train(args, device, out_dir: Path, pool_tr: SokoPool):
                 peak_mem = max(peak_mem, torch.cuda.max_memory_allocated() / 2 ** 20)
             if it % args.log_every == 0 or it == 1:
                 rec = dict(it=it, elapsed=round(el, 1), T=T, loss=round(loss_val, 4),
-                           gn=round(gn, 3), sec=round(time.time() - t_it, 3), tier=tier, **m)
+                           gn=round(gn, 3), sec=round(time.time() - t_it, 3), curriculum=tier, **m)
                 logf.write(json.dumps(rec) + "\n"); logf.flush()
                 hist.append(rec)
                 if it % (args.log_every * 5) == 0 or it == 1:
