@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _ckpt
 
-__version__ = "1.1.0"
+__version__ = "1.1.2"
 T0 = time.time()
 
 # Directions: 0=Up(-1,0), 1=Down(+1,0), 2=Left(0,-1), 3=Right(0,+1)
@@ -1055,34 +1055,54 @@ def simulate_solve(net, H, W, walls, goals, boxes, player, device, T=4, max_step
     return False, nodes, trace
 
 
+def _ascii_board(H, W, walls, goals, bx, pl):
+    rows = []
+    for r in range(H):
+        row = []
+        for c in range(W):
+            i = r * W + c
+            if walls[i]: ch = "#"
+            elif i == pl: ch = "+" if goals[i] else "@"
+            elif bx[i]: ch = "*" if goals[i] else "$"
+            elif goals[i]: ch = "."
+            else: ch = " "
+            row.append(ch)
+        rows.append("".join(row))
+    return "\n".join(rows)
+
+
 def render_episode_video(H, W, walls, goals, trace, title: str, out_base: Path):
-    """Renders crisp tile-art frames of Sokoban gameplay -> saves .gif (always) + .mp4 (if available)."""
+    """Renders crisp tile-art frames -> saves .gif + *_storyboard.png (+ .mp4 if available)."""
     try:
         from PIL import Image, ImageDraw
     except Exception:
         return None
-    TILE = 48
-    HUD = 44
+    assert not is_solved_np(trace[0][0], goals), "Video trace[0] already solved!"
+    TILE = 52
+    HUD = 48
     W_px, H_px = W * TILE, H * TILE + HUD
     frames = []
     tot_steps = max(1, len(trace) - 1)
+    n_tot_boxes = int(goals.sum())
     for t, (bx, pl, act, conf, val) in enumerate(trace):
         img = Image.new("RGB", (W_px, H_px), (24, 26, 32))
         dr = ImageDraw.Draw(img)
         solved_now = is_solved_np(bx, goals)
+        on_g = int((bx & goals).sum())
         act_str = DIR_NAMES[act] if act >= 0 else "START"
-        hud_col = (28, 120, 72) if solved_now else (30, 34, 46)
+        hud_col = (26, 130, 76) if solved_now else ((40, 62, 110) if t == 0 else (30, 34, 46))
         dr.rectangle([0, 0, W_px, HUD], fill=hud_col)
-        dr.text((10, 7), f"{title}", fill=(235, 240, 250))
-        dr.text((10, 24), f"step {t}/{tot_steps} | act={act_str} | p={conf:.2f} | V={val:.2f}" +
-                (" | SOLVED!" if solved_now else ""), fill=(200, 230, 255))
+        dr.text((10, 6), f"{title} | boxes {on_g}/{n_tot_boxes}", fill=(240, 244, 255))
+        status = " | SOLVED!" if solved_now else (" | INITIAL STATE" if t == 0 else "")
+        dr.text((10, 25), f"step {t}/{tot_steps} | act={act_str} | p={conf:.2f} | V={val:.2f}{status}",
+                fill=(210, 235, 255))
         for r in range(H):
             for c in range(W):
                 i = r * W + c
                 x0, y0 = c * TILE, HUD + r * TILE
                 x1, y1 = x0 + TILE, y0 + TILE
                 if walls[i]:
-                    dr.rectangle([x0, y0, x1 - 1, y1 - 1], fill=(56, 62, 78))
+                    dr.rectangle([x0, y0, x1 - 1, y1 - 1], fill=(54, 60, 76))
                     dr.rectangle([x0 + 3, y0 + 3, x1 - 4, y1 - 4], outline=(78, 86, 108), width=2)
                 else:
                     dr.rectangle([x0, y0, x1 - 1, y1 - 1], fill=(238, 232, 218))
@@ -1092,23 +1112,35 @@ def render_episode_video(H, W, walls, goals, trace, title: str, out_base: Path):
                         dr.polygon([(cx, y0 + 10), (x1 - 10, cy), (cx, y1 - 10), (x0 + 10, cy)],
                                    fill=(72, 195, 130), outline=(36, 135, 84))
                     if bx[i]:
-                        col = (245, 185, 55) if goals[i] else (196, 124, 58)
-                        bd = (180, 125, 20) if goals[i] else (130, 76, 28)
+                        col = (245, 190, 55) if goals[i] else (196, 124, 58)
+                        bd = (175, 120, 18) if goals[i] else (130, 76, 28)
                         dr.rectangle([x0 + 6, y0 + 6, x1 - 7, y1 - 7], fill=col, outline=bd, width=3)
-                        dr.line([x0 + 8, y0 + 8, x1 - 9, y1 - 9], fill=bd, width=2)
-                        dr.line([x1 - 9, y0 + 8, x0 + 8, y1 - 9], fill=bd, width=2)
+                        dr.line([x0 + 9, y0 + 9, x1 - 10, y1 - 10], fill=bd, width=2)
+                        dr.line([x1 - 10, y0 + 9, x0 + 9, y1 - 10], fill=bd, width=2)
                     if i == pl:
-                        dr.ellipse([x0 + 8, y0 + 8, x1 - 9, y1 - 9], fill=(46, 145, 235), outline=(20, 75, 145), width=3)
-                        dr.ellipse([x0 + 16, y0 + 17, x0 + 21, y0 + 22], fill=(255, 255, 255))
-                        dr.ellipse([x1 - 22, y0 + 17, x1 - 17, y0 + 22], fill=(255, 255, 255))
-        frames.append(img)
-    # Pause slightly on final solved frame
-    for _ in range(5):
+                        dr.ellipse([x0 + 9, y0 + 9, x1 - 10, y1 - 10], fill=(46, 145, 235), outline=(18, 70, 140), width=3)
+                        dr.ellipse([x0 + 17, y0 + 19, x0 + 22, y0 + 24], fill=(255, 255, 255))
+                        dr.ellipse([x1 - 23, y0 + 19, x1 - 18, y0 + 24], fill=(255, 255, 255))
+        if t == 0:
+            for _ in range(5):
+                frames.append(img)
+        else:
+            frames.append(img)
+    for _ in range(6):
         frames.append(frames[-1])
     gif_path = out_base.with_suffix(".gif")
     frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=240, loop=0)
-    saved = [str(gif_path)]
-    # Also try MP4 if cv2 or imageio-ffmpeg is available
+
+    core_idx = [4] + [4 + k for k in range(1, len(trace))]
+    picks = sorted(set([core_idx[0]] + [core_idx[int(round(i * (len(core_idx) - 1) / 4))] for i in range(1, 4)] + [core_idx[-1]]))
+    pad = 8
+    sheet = Image.new("RGB", (len(picks) * W_px + (len(picks) - 1) * pad, H_px), (18, 20, 26))
+    for k_i, idx_f in enumerate(picks):
+        sheet.paste(frames[idx_f], (k_i * (W_px + pad), 0))
+    sb_path = Path(str(out_base) + "_storyboard.png")
+    sheet.save(sb_path)
+    print(f"[video-check] {out_base.name}: {len(trace)-1} steps | solved_end={is_solved_np(trace[-1][0], goals)}")
+    saved = [str(gif_path), str(sb_path)]
     try:
         import imageio.v2 as iio
         mp4_path = out_base.with_suffix(".mp4")
@@ -1117,19 +1149,8 @@ def render_episode_video(H, W, walls, goals, trace, title: str, out_base: Path):
                 wr.append_data(np.asarray(fr))
         saved.append(str(mp4_path))
     except Exception:
-        try:
-            import cv2
-            mp4_path = out_base.with_suffix(".mp4")
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            vw = cv2.VideoWriter(str(mp4_path), fourcc, 4.0, (W_px, H_px))
-            for fr in frames:
-                vw.write(cv2.cvtColor(np.asarray(fr), cv2.COLOR_RGB2BGR))
-            vw.release()
-            saved.append(str(mp4_path))
-        except Exception:
-            pass
+        pass
     return saved
-
 
 def pass_at_k(n, c, k):
     if n - c < k:
@@ -1148,7 +1169,7 @@ def wilson(k, n, z=1.96):
 
 @torch.no_grad()
 def evaluate(net, pool, device, mdp, n_samples=4, temp=0.8, T=4, per_tier=32,
-             run_sys2=True, max_nodes=64, video_dir: Path | None = None, check_bfs=False):
+             run_sys2=True, max_nodes=64, video_dir: Path | None = None, check_bfs=False, video_prefix='play'):
     net.eval()
     res = {"T": T, "n_samples": n_samples, "tiers": {}}
     best_s1 = None   # hardest solved by pure Sys1 pass@1
@@ -1185,7 +1206,7 @@ def evaluate(net, pool, device, mdp, n_samples=4, temp=0.8, T=4, per_tier=32,
         gs = e.solved.cpu().numpy()
         for j in range(n):
             if gs[j]:
-                score = (t, len(traces[j]))
+                score = (t, -len(traces[j]))
                 if best_s1 is None or score > best_s1[0]:
                     best_s1 = (score, t, f"Sys1 pass@1 | {TIER_NAMES[t]}", wl[j], gl[j], traces[j])
 
@@ -1239,7 +1260,7 @@ def evaluate(net, pool, device, mdp, n_samples=4, temp=0.8, T=4, per_tier=32,
                                 vis_b.add((p1_b, bn_b)); q_b.append((p1_b, bn_b))
                     bfs_n.append(nb_cnt)
                 if ok_j and n_j > 0:
-                    sc2 = (t, n_j, len(tr_j))
+                    sc2 = (t, -len(tr_j), n_j)
                     if best_s2 is None or sc2 > best_s2[0]:
                         best_s2 = (sc2, t, f"Sys2({n_j}n) | {TIER_NAMES[t]}", wl[j], gl[j], tr_j)
             d["sys2_pass"] = float(np.mean(s2_ok))
@@ -1252,10 +1273,10 @@ def evaluate(net, pool, device, mdp, n_samples=4, temp=0.8, T=4, per_tier=32,
         vids = []
         if best_s1 is not None:
             _sc, _t, label, w_d, g_d, tr_d = best_s1
-            vids += render_episode_video(pool.H, pool.W, w_d, g_d, tr_d, label, video_dir / "play_sys1_pass1") or []
+            vids += render_episode_video(pool.H, pool.W, w_d, g_d, tr_d, label, video_dir / f"{video_prefix}_sys1_pass1") or []
         if best_s2 is not None:
             _sc, _t, label, w_d, g_d, tr_d = best_s2
-            vids += render_episode_video(pool.H, pool.W, w_d, g_d, tr_d, label, video_dir / "play_sys2") or []
+            vids += render_episode_video(pool.H, pool.W, w_d, g_d, tr_d, label, video_dir / f"{video_prefix}_sys2") or []
         res["video_files"] = vids
         print(f"[video] rendered -> {vids}")
     net.train()
@@ -1432,11 +1453,16 @@ def _atomic_save(obj, path: Path):
     os.replace(tmp, path)
 
 
-def train(args, device, out_dir: Path, pool_tr: SokoPool):
+def train(args, device, out_dir: Path, pool_tr: SokoPool, resume_ck=None):
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed + 1)
     net = SokobanNet(H=args.size, W=args.size, C=args.width, heads=args.heads, L=args.layers, T_cyc=8).to(device)
     ema = EMA(net, decay=0.999)
+    if resume_ck is not None:
+        net.load_state_dict(resume_ck.get("raw_model", resume_ck["model"]))
+        ema.shadow = {k: v.to(device).clone() for k, v in resume_ck["model"].items()}
+        ema.steps = int(resume_ck.get("iters", 100))
+        print(f"[resume] loaded checkpoint iters={ema.steps}, tier={resume_ck.get('tier', 2)}")
     npar = sum(p.numel() for p in net.parameters())
     opt = MuonAdamW(net, lr_muon=args.lr_muon, lr_adam=args.lr_adam, wd=args.wd)
     mdp = SokoMDP(max_steps=args.max_steps, shaping=not args.no_shaping)
@@ -1444,9 +1470,10 @@ def train(args, device, out_dir: Path, pool_tr: SokoPool):
     t_start = time.time()
     logf = open(out_dir / "metrics.jsonl", "w", encoding="utf-8")
     hist = []
-    tier = 1
+    tier = int(resume_ck.get('tier', 2)) if resume_ck is not None else 1
     roll_ema = 0.0
     rl_started = False
+    rl_in_tier = 0
     it = 0
     sl_only_until = args.sl_frac * budget
     use_amp = (device == "cuda")
@@ -1502,9 +1529,9 @@ def train(args, device, out_dir: Path, pool_tr: SokoPool):
                 (loss * loss_scale).backward()
                 loss_val = float(loss.detach())
                 roll_ema = m["roll_pass"] if not rl_started else (0.9 * roll_ema + 0.1 * m["roll_pass"])
-                rl_started = True
-                if roll_ema > 0.75 and tier < 4:
-                    tier += 1; roll_ema = 0.0; rl_started = False
+                rl_started = True; rl_in_tier += 1
+                if rl_in_tier >= 15 and roll_ema > 0.75 and tier < 4:
+                    tier += 1; roll_ema = 0.0; rl_started = False; rl_in_tier = 0
                     print(f"[train] curriculum -> {TIER_NAMES[tier]} (it={it})")
             if use_amp:
                 inv = 1.0 / loss_scale
@@ -1615,6 +1642,7 @@ def get_args():
     p.add_argument("--eval-temp", type=float, default=0.7)
     p.add_argument("--sim-nodes", type=int, default=64)
     p.add_argument("--ckpt", default="")
+    p.add_argument("--resume", default="")
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--quick", action="store_true")
     a = p.parse_args()
@@ -1650,7 +1678,11 @@ def main():
 
     hist, it, peak, npar = [], 0, 0.0, 0
     if args.mode in ("train", "all"):
-        net, npar, hist, it, peak = train(args, dev, out, pool_tr)
+        resume_ck = torch.load(args.resume, map_location=dev, weights_only=False) if args.resume else None
+        if resume_ck is not None:
+            sa = resume_ck["args"]
+            args.size, args.width, args.heads, args.layers = sa["size"], sa["width"], sa["heads"], sa["layers"]
+        net, npar, hist, it, peak = train(args, dev, out, pool_tr, resume_ck=resume_ck)
     else:
         ck = torch.load(args.ckpt or (out / "weights.pt"), map_location=dev, weights_only=False)
         sa = ck["args"]
@@ -1692,7 +1724,7 @@ def main():
         net10.load_state_dict(sd_tr, strict=False)
         zs_ev = evaluate(net10, pool_10, dev, SokoMDP(max_steps=64, shaping=not args.no_shaping),
                          n_samples=2, temp=args.eval_temp, T=args.t_eval, per_tier=min(args.test_per_tier, 24),
-                         run_sys2=True, max_nodes=args.sim_nodes, video_dir=out)
+                         run_sys2=True, max_nodes=args.sim_nodes, video_dir=out, video_prefix="play_10x10")
         zs_res = zs_ev["tiers"]
         for t, d in sorted(zs_res.items(), key=lambda kv: int(kv[0])):
             print(f"   [ZERO-SHOT 10x10] {d['name']:<14} greedy={d['greedy_pass1']:.3f} pass@2={d['pass_at_2']:.3f} sys2={d['sys2_pass']:.3f}(nodes={d['sys2_avg_nodes']:.1f})")
