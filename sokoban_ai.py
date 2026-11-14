@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _ckpt
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 T0 = time.time()
 
 # Directions: 0=Up(-1,0), 1=Down(+1,0), 2=Left(0,-1), 3=Right(0,+1)
@@ -430,7 +430,7 @@ def build_pool(seed, n_per_tier, H, W, tag, cache_dir: Path, verbose=True):
                         z["tiers"], z["opt_lens"], z["trajs"].tolist())
     rng = np.random.default_rng(seed)
     # Tier specs: (tier, n_boxes, min_opt, max_pulls)
-    specs = [(1, 1, 4, 16), (2, 2, 7, 26), (3, 3, 9, 34), (4, 4, 10, 40)]
+    specs = [(1, 1, 5, 18), (2, 2, 8, 30), (3, 3, 11, 42), (4, 4, 15, 55)]
     WL, GL, BL, PL, TL, OL, TR = [], [], [], [], [], [], []
     seen_sigs = set()
     t0 = time.time()
@@ -1148,10 +1148,11 @@ def wilson(k, n, z=1.96):
 
 @torch.no_grad()
 def evaluate(net, pool, device, mdp, n_samples=4, temp=0.8, T=4, per_tier=32,
-             run_sys2=True, max_nodes=64, video_out: Path | None = None):
+             run_sys2=True, max_nodes=64, video_dir: Path | None = None, check_bfs=False):
     net.eval()
     res = {"T": T, "n_samples": n_samples, "tiers": {}}
-    best_demo = None  # (priority, tier, label, walls, goals, trace)
+    best_s1 = None   # hardest solved by pure Sys1 pass@1
+    best_s2 = None   # hardest solved by Sys2 search
     for t in (1, 2, 3, 4):
         idx = pool.by_tier.get(t, np.empty(0, int))
         if len(idx) == 0:
@@ -1184,9 +1185,9 @@ def evaluate(net, pool, device, mdp, n_samples=4, temp=0.8, T=4, per_tier=32,
         gs = e.solved.cpu().numpy()
         for j in range(n):
             if gs[j]:
-                score = (t, 2, len(traces[j]))  # prefer highest tier solved by Sys1 greedy
-                if best_demo is None or score[:2] > best_demo[0][:2]:
-                    best_demo = (score, t, f"Sys1 pass@1 | {TIER_NAMES[t]}", wl[j], gl[j], traces[j])
+                score = (t, len(traces[j]))
+                if best_s1 is None or score > best_s1[0]:
+                    best_s1 = (score, t, f"Sys1 pass@1 | {TIER_NAMES[t]}", wl[j], gl[j], traces[j])
 
         # ---- System 1 Stochastic (pass@1, pass@2)
         cnt = np.zeros(n, dtype=int)
@@ -1214,28 +1215,49 @@ def evaluate(net, pool, device, mdp, n_samples=4, temp=0.8, T=4, per_tier=32,
                  pass_at_1=float(np.mean([pass_at_k(n_samples, int(c), 1) for c in cnt])) if n_samples else float(gs.mean()),
                  pass_at_2=float(np.mean([pass_at_k(n_samples, int(c), 2) for c in cnt])) if n_samples else float(gs.mean()))
         if run_sys2:
-            s2_ok, s2_n = [], []
+            s2_ok, s2_n, bfs_n = [], [], []
             for j in range(n):
                 ok_j, n_j, tr_j = simulate_solve(net, pool.H, pool.W, wl[j], gl[j], bx[j], pl[j],
                                                  device, T=T, max_steps=mdp.max_steps, max_nodes=max_nodes)
                 s2_ok.append(ok_j); s2_n.append(n_j)
-                if ok_j:
-                    sc = (t, 1 if n_j > 0 else 2, len(tr_j))
-                    if best_demo is None or sc[:2] > best_demo[0][:2]:
-                        tag_m = "Sys1" if n_j == 0 else f"Sys2({n_j}n)"
-                        best_demo = (sc, t, f"{tag_m} | {TIER_NAMES[t]}", wl[j], gl[j], tr_j)
+                if check_bfs:
+                    # count unguided naive BFS expansions for efficiency comparison
+                    q_b = deque([(int(pl[j]), _arr_to_mask(bx[j]))]); vis_b = set(q_b); nb_cnt = 0
+                    gm_b = _arr_to_mask(gl[j]); tp_b = get_topo(pool.H, pool.W)
+                    while q_b and nb_cnt < 10_000:
+                        pp_b, bm_b = q_b.popleft(); nb_cnt += 1
+                        if bm_b == gm_b: break
+                        for dd in range(4):
+                            p1_b = int(tp_b.nb1[pp_b, dd])
+                            if wl[j][p1_b]: continue
+                            bn_b = bm_b
+                            if (bm_b >> p1_b) & 1:
+                                p2_b = int(tp_b.nb2[pp_b, dd])
+                                if wl[j][p2_b] or ((bm_b >> p2_b) & 1): continue
+                                bn_b = (bm_b ^ (1 << p1_b)) | (1 << p2_b)
+                            if (p1_b, bn_b) not in vis_b:
+                                vis_b.add((p1_b, bn_b)); q_b.append((p1_b, bn_b))
+                    bfs_n.append(nb_cnt)
+                if ok_j and n_j > 0:
+                    sc2 = (t, n_j, len(tr_j))
+                    if best_s2 is None or sc2 > best_s2[0]:
+                        best_s2 = (sc2, t, f"Sys2({n_j}n) | {TIER_NAMES[t]}", wl[j], gl[j], tr_j)
             d["sys2_pass"] = float(np.mean(s2_ok))
             d["sys2_avg_nodes"] = float(np.mean(s2_n))
+            if bfs_n:
+                d["bfs_avg_nodes"] = float(np.mean(bfs_n))
         res["tiers"][t] = d
 
-    if video_out is not None:
-        if best_demo is None:
-            # fallback: show first test level Sys1 attempt
-            best_demo = ((0, 0, 0), 1, "Sys1 attempt", wl[0], gl[0], traces[0])
-        _sc, _t, label, w_d, g_d, tr_d = best_demo
-        saved = render_episode_video(pool.H, pool.W, w_d, g_d, tr_d, label, video_out)
-        res["video_files"] = saved
-        print(f"[video] rendered featured run ({label}, {len(tr_d)-1} steps) -> {saved}")
+    if video_dir is not None:
+        vids = []
+        if best_s1 is not None:
+            _sc, _t, label, w_d, g_d, tr_d = best_s1
+            vids += render_episode_video(pool.H, pool.W, w_d, g_d, tr_d, label, video_dir / "play_sys1_pass1") or []
+        if best_s2 is not None:
+            _sc, _t, label, w_d, g_d, tr_d = best_s2
+            vids += render_episode_video(pool.H, pool.W, w_d, g_d, tr_d, label, video_dir / "play_sys2") or []
+        res["video_files"] = vids
+        print(f"[video] rendered -> {vids}")
     net.train()
     return res
 
@@ -1531,12 +1553,25 @@ def write_report(out: Path, args, proofs, npar, it, peak, ev):
     for r in proofs.rows:
         L.append(f"| {r['id']} | {r['name']} | **{r['status']}** | {r['detail']} |")
     L += ["\n## 2. Held-Out Sokoban Results (disjoint D4-canonical levels)\n",
-          "| tier | n | opt_steps | Sys1 greedy | pass@1 | pass@2 | Sys1+2 (`simulate`) | avg nodes |\n|---|---|---|---|---|---|---|---|"]
+          "| tier | n | opt_steps | Sys1 greedy | pass@1 | pass@2 | Sys1+2 (`simulate`) | Sys2 nodes | Blind BFS nodes |\n|---|---|---|---|---|---|---|---|---|"]
     for t, d in sorted(ev["tiers"].items(), key=lambda kv: int(kv[0])):
         L.append(f"| {d['name']} | {d['n_levels']} | {d['opt_steps']:.1f} | {d['greedy_pass1']:.3f} | "
-                 f"{d['pass_at_1']:.3f} | {d['pass_at_2']:.3f} | **{d.get('sys2_pass', 0):.3f}** | {d.get('sys2_avg_nodes', 0):.1f} |")
+                 f"{d['pass_at_1']:.3f} | {d['pass_at_2']:.3f} | **{d.get('sys2_pass', 0):.3f}** | {d.get('sys2_avg_nodes', 0):.1f} | {d.get('bfs_avg_nodes', 0):.0f} |")
+    if ev.get("zeroshot_10x10"):
+        L += ["\n## 3. Zero-Shot Size Transfer (Trained 8x8 -> Tested 10x10, 0 extra training)\n",
+              "| tier | n | opt_steps | Sys1 greedy | pass@2 | Sys1+2 | avg nodes |\n|---|---|---|---|---|---|---|"]
+        for t, d in sorted(ev["zeroshot_10x10"].items(), key=lambda kv: int(kv[0])):
+            L.append(f"| {d['name']} | {d['n_levels']} | {d['opt_steps']:.1f} | {d['greedy_pass1']:.3f} | {d['pass_at_2']:.3f} | **{d.get('sys2_pass', 0):.3f}** | {d.get('sys2_avg_nodes', 0):.1f} |")
+    if ev.get("memorisation"):
+        L += ["\n## 4. Memorisation Control (TRAIN vs TEST)\n| tier | train | test | gap |\n|---|---|---|---|"]
+        for t, g in sorted(ev["memorisation"].items(), key=lambda kv: int(kv[0])):
+            L.append(f"| {TIER_NAMES[int(t)]} | {g['train']:.3f} | {g['test']:.3f} | {g['gap']:+.3f} |")
+    if ev.get("sweep"):
+        L += ["\n## 5. Recurrence-Depth Ablation (T3-T4)\n| T steps | Sys1 greedy |\n|---|---|"]
+        for k, v in ev["sweep"].items():
+            L.append(f"| {k} | {v:.3f} |")
     if ev.get("video_files"):
-        L.append(f"\n## 3. Featured Gameplay Video\n* Rendered: `{ev['video_files']}`")
+        L.append(f"\n## 6. Featured Gameplay Videos\n* Rendered: `{ev['video_files']}`")
     (out / "report.md").write_text("\n".join(L), encoding="utf-8")
     print(f"[report] {out/'report.md'}")
 
@@ -1625,12 +1660,44 @@ def main():
     mdp = SokoMDP(max_steps=args.max_steps, shaping=not args.no_shaping)
     ev = evaluate(net, pool_te, dev, mdp, n_samples=args.eval_samples, temp=args.eval_temp,
                   T=args.t_eval, per_tier=args.test_per_tier, run_sys2=True,
-                  max_nodes=args.sim_nodes, video_out=out / "play_best")
-    (out / "eval.json").write_text(json.dumps(ev, indent=2), encoding="utf-8")
+                  max_nodes=args.sim_nodes, video_dir=out, check_bfs=True)
     for t, d in sorted(ev["tiers"].items(), key=lambda kv: int(kv[0])):
+        bf = f" bfs_nodes={d['bfs_avg_nodes']:.0f}" if "bfs_avg_nodes" in d else ""
         print(f"   {d['name']:<14} n={d['n_levels']:3d} greedy={d['greedy_pass1']:.3f} "
               f"pass@1={d['pass_at_1']:.3f} pass@2={d['pass_at_2']:.3f} "
-              f"sys2={d['sys2_pass']:.3f}(nodes={d['sys2_avg_nodes']:.1f})")
+              f"sys2={d['sys2_pass']:.3f}(nodes={d['sys2_avg_nodes']:.1f}{bf})")
+
+    # Memorisation check (train vs test)
+    mem = evaluate(net, pool_tr, dev, mdp, n_samples=0, T=args.t_eval, per_tier=min(args.test_per_tier, 24), run_sys2=False)
+    gap = {t: dict(train=mem["tiers"][t]["greedy_pass1"], test=d["greedy_pass1"],
+                   gap=mem["tiers"][t]["greedy_pass1"] - d["greedy_pass1"])
+           for t, d in ev["tiers"].items() if t in mem["tiers"]}
+    for t, g in sorted(gap.items(), key=lambda kv: int(kv[0])):
+        print(f"   [memorisation] {TIER_NAMES[int(t)]:<14} train={g['train']:.3f} test={g['test']:.3f} gap={g['gap']:+.3f}")
+
+    # Recurrence-depth ablation (T=1,2,4,8,12) on T3+T4
+    sweep = {}
+    for T_ab in (1, 2, 4, 8, 12):
+        e_ab = evaluate(net, pool_te, dev, mdp, n_samples=0, T=T_ab, per_tier=min(args.test_per_tier, 24), run_sys2=False)
+        hard_ab = [e_ab["tiers"][k]["greedy_pass1"] for k in (3, 4) if k in e_ab["tiers"]]
+        sweep[T_ab] = float(np.mean(hard_ab)) if hard_ab else 0.0
+        print(f"   [ablation T3-T4] T={T_ab:2d} greedy={sweep[T_ab]:.3f}")
+
+    # Zero-shot size transfer: load 8x8 weights directly into 10x10 net (0 extra training!)
+    zs_res = {}
+    if args.size == 8:
+        pool_10 = build_pool(args.seed + 99_000, min(args.test_per_tier, 24), 10, 10, "zeroshot_10x10", cache, verbose=False)
+        net10 = SokobanNet(H=10, W=10, C=args.width, heads=args.heads, L=args.layers, T_cyc=8).to(dev)
+        sd_tr = {k: v for k, v in net.state_dict().items() if not k.startswith(("ug_", "ud_", "inv_"))}
+        net10.load_state_dict(sd_tr, strict=False)
+        zs_ev = evaluate(net10, pool_10, dev, SokoMDP(max_steps=64, shaping=not args.no_shaping),
+                         n_samples=2, temp=args.eval_temp, T=args.t_eval, per_tier=min(args.test_per_tier, 24),
+                         run_sys2=True, max_nodes=args.sim_nodes, video_dir=out)
+        zs_res = zs_ev["tiers"]
+        for t, d in sorted(zs_res.items(), key=lambda kv: int(kv[0])):
+            print(f"   [ZERO-SHOT 10x10] {d['name']:<14} greedy={d['greedy_pass1']:.3f} pass@2={d['pass_at_2']:.3f} sys2={d['sys2_pass']:.3f}(nodes={d['sys2_avg_nodes']:.1f})")
+    ev["memorisation"] = gap; ev["sweep"] = sweep; ev["zeroshot_10x10"] = zs_res
+    (out / "eval.json").write_text(json.dumps(ev, indent=2), encoding="utf-8")
     write_report(out, args, proofs, npar, it, peak, ev)
     return 0 if proofs.all_ok else 1
 
