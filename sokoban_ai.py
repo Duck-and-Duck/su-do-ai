@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _ckpt
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 T0 = time.time()
 
 # Directions: 0=Up(-1,0), 1=Down(+1,0), 2=Left(0,-1), 3=Right(0,+1)
@@ -471,14 +471,15 @@ def sokoban_features_and_mask(H: int, W: int, walls, goals, boxes, players):
     b = boxes.float()
     fl = (~walls).float()
     bg = (boxes & goals).float()
-    free = (~walls & ~boxes).float()
+    free_b = (~walls) & (~boxes)
+    free = free_b.float()
 
     # Gather neighbor states in all 4 directions: (B, N, 4)
     nb1_w = w[:, nb1]; nb1_b = b[:, nb1]; nb1_g = g[:, nb1]; nb1_f = free[:, nb1]
     nb2_w = w[:, nb2]; nb2_b = b[:, nb2]; nb2_g = g[:, nb2]; nb2_f = free[:, nb2]
 
     # Directional move legality from each cell (and at player's cell)
-    can_move_dir = (~walls[:, nb1]) & ((~boxes[:, nb1]) | free[:, nb2])  # (B, N, 4)
+    can_move_dir = (~walls[:, nb1]) & ((~boxes[:, nb1]) | free_b[:, nb2])  # (B, N, 4)
     legal_bool = can_move_dir & (p_oh.unsqueeze(-1) > 0.5)
 
     # Ray-ahead box/goal visibility (100% D4-equivariant!)
