@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _ckpt
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 T0 = time.time()
 
 # Directions: 0=Up(-1,0), 1=Down(+1,0), 2=Left(0,-1), 3=Right(0,+1)
@@ -333,7 +333,7 @@ def generate_level(rng: np.random.Generator, H: int, W: int, n_boxes: int, min_o
                 boxes[b_pull] = False
                 boxes[player] = True
             player = p_new
-        if is_solved_np(boxes, goals):
+        if is_solved_np(boxes, goals) or bool((boxes & goals).any()):
             continue
         opt_len, acts, path = bfs_solve(H, W, w_flat, goals, boxes, player, node_cap=50_000)
         if opt_len >= min_opt:
