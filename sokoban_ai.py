@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _ckpt
 
-__version__ = "1.1.3"
+__version__ = "1.2.0"
 T0 = time.time()
 
 # Directions: 0=Up(-1,0), 1=Down(+1,0), 2=Left(0,-1), 3=Right(0,+1)
@@ -169,6 +169,100 @@ def _arr_to_mask(arr) -> int:
     for i in np.flatnonzero(arr):
         m |= (1 << int(i))
     return m
+
+
+def _goal_dists(topo: GridTopo, w_bool, goals):
+    g_cells = [int(i) for i in np.flatnonzero(goals)]
+    dists = []
+    for gc in g_cells:
+        d_arr = [999] * topo.N
+        d_arr[gc] = 0
+        q = deque([gc])
+        while q:
+            u = q.popleft()
+            du = d_arr[u] + 1
+            for d in range(4):
+                v = int(topo.nb1[u, d])
+                if not w_bool[v] and d_arr[v] > du:
+                    d_arr[v] = du
+                    q.append(v)
+        dists.append(d_arr)
+    return dists
+
+
+def astar_solve(H: int, W: int, walls, goals, boxes, player: int, node_cap: int = 80_000):
+    """Exact optimal A* with admissible wall-aware matching + sound corner pruning."""
+    topo = get_topo(H, W)
+    if not is_valid_state(walls, goals, boxes, player):
+        return -1, [], []
+    goal_mask = _arr_to_mask(goals)
+    init_b = _arr_to_mask(boxes)
+    if init_b == goal_mask:
+        return 0, [], [(boxes.copy(), player)]
+    w_bool = [bool(v) for v in walls]
+    g_bool = [bool(v) for v in goals]
+    gdists = _goal_dists(topo, w_bool, goals)
+    k_boxes = len(gdists)
+    perms = list(itertools.permutations(range(k_boxes)))
+
+    def heur(bm: int) -> int:
+        b_idx = []
+        m = bm
+        while m:
+            lsb = m & -m; m ^= lsb
+            b_idx.append(lsb.bit_length() - 1)
+        best_h = 9999
+        for prm in perms:
+            tot = 0
+            for j, bi in enumerate(b_idx):
+                tot += gdists[prm[j]][bi]
+            if tot < best_h:
+                best_h = tot
+        return best_h
+
+    uid = itertools.count()
+    pq = [(heur(init_b), 0, next(uid), player, init_b)]
+    g_cost = {(player, init_b): 0}
+    parent = {(player, init_b): None}
+    nodes = 0
+    nb1, nb2 = topo.nb1, topo.nb2
+    while pq:
+        _f, g, _id, p, bm = heapq.heappop(pq)
+        if g > g_cost.get((p, bm), 999999):
+            continue
+        nodes += 1
+        if nodes > node_cap:
+            return -1, [], []
+        if bm == goal_mask:
+            acts, path = [], []
+            cur = (p, bm)
+            while parent[cur] is not None:
+                pp, pbm, pd = parent[cur]
+                acts.append(pd)
+                arr = np.zeros(topo.N, dtype=bool)
+                for idx_b in range(topo.N):
+                    if (pbm >> idx_b) & 1: arr[idx_b] = True
+                path.append((arr, pp))
+                cur = (pp, pbm)
+            acts.reverse(); path.reverse()
+            return len(acts), acts, path
+        for d in range(4):
+            p1 = int(nb1[p, d])
+            if w_bool[p1]: continue
+            b_next = bm
+            if (bm >> p1) & 1:
+                p2 = int(nb2[p, d])
+                if w_bool[p2] or ((bm >> p2) & 1): continue
+                b_next = (bm ^ (1 << p1)) | (1 << p2)
+                if b_next != goal_mask and _box_corner_dead(topo, w_bool, g_bool, b_next):
+                    continue
+            st = (p1, b_next)
+            ng = g + 1
+            if ng < g_cost.get(st, 999999):
+                g_cost[st] = ng
+                parent[st] = (p, bm, d)
+                heapq.heappush(pq, (ng + heur(b_next), ng, next(uid), p1, b_next))
+    return -1, [], []
 
 
 def bfs_solve(H: int, W: int, walls, goals, boxes, player: int, node_cap: int = 80_000):
@@ -335,7 +429,7 @@ def generate_level(rng: np.random.Generator, H: int, W: int, n_boxes: int, min_o
             player = p_new
         if is_solved_np(boxes, goals) or bool((boxes & goals).any()):
             continue
-        opt_len, acts, path = bfs_solve(H, W, w_flat, goals, boxes, player, node_cap=50_000)
+        opt_len, acts, path = astar_solve(H, W, w_flat, goals, boxes, player, node_cap=50_000)
         if opt_len >= min_opt:
             return dict(walls=w_flat.copy(), goals=goals, boxes=boxes, player=player,
                         opt_len=opt_len, acts=np.array(acts, dtype=np.int8), path=path)
@@ -1337,9 +1431,10 @@ def run_proofs(H=8, W=8, device="cpu", seed=7):
     agree = True
     for lv in lvs[:5]:
         o1, _, _ = bfs_solve(H, W, lv["walls"], lv["goals"], lv["boxes"], lv["player"], 40_000)
+        o3, _, _ = astar_solve(H, W, lv["walls"], lv["goals"], lv["boxes"], lv["player"], 40_000)
         o2 = naive_bfs_solve(H, W, lv["walls"], lv["goals"], lv["boxes"], lv["player"], 40_000)
-        agree &= (o1 == o2 and o1 > 0)
-    P.add("P2", "BFS+pruning == unpruned reference", agree, f"{len(lvs[:5])} levels exact shortest-path match")
+        agree &= (o1 == o2 == o3 and o1 > 0)
+    P.add("P2", "BFS == A* == unpruned reference", agree, f"{len(lvs[:5])} levels exact shortest-path match")
 
     # P10 info accounting
     n_walk = H * W - 2 * H - 2 * (W - 2)
@@ -1492,7 +1587,8 @@ def train(args, device, out_dir: Path, pool_tr: SokoPool, resume_ck=None):
             phase = "ssl" if el < sl_only_until else "rl+ssl"
             t_it = time.time()
             if phase == "ssl" or (it % args.ssl_every == args.ssl_every - 1):
-                idx = pool_tr.sample(rng, args.ssl_batch)
+                n_h = int(args.ssl_batch * 0.60)
+                idx = np.concatenate([pool_tr.sample(rng, args.ssl_batch - n_h), pool_tr.sample(rng, n_h, tier=4)])
                 wl = pool_tr.walls[idx]; gl = pool_tr.goals[idx]
                 bx_l, pl_l, tg_l = [], [], []
                 for j in idx:
@@ -1643,6 +1739,7 @@ def get_args():
     p.add_argument("--sim-nodes", type=int, default=64)
     p.add_argument("--ckpt", default="")
     p.add_argument("--resume", default="")
+    p.add_argument("--boxoban-train", type=int, default=0)
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--quick", action="store_true")
     a = p.parse_args()
@@ -1668,6 +1765,57 @@ def main():
         return 0 if proofs.all_ok else 1
 
     pool_tr = build_pool(args.seed, args.pool_per_tier, args.size, args.size, "train", cache)
+    if args.boxoban_train > 0 and args.size == 10:
+        import urllib.request
+        bf = cache / f"boxoban_train_{args.boxoban_train}.npz"
+        if bf.exists():
+            bz = np.load(bf, allow_pickle=True)
+            BWL, BGL, BBL, BPL, BTL, BOL, BTR = (bz["walls"], bz["goals"], bz["boxes"], bz["players"],
+                                                  bz["tiers"], bz["opt_lens"], bz["trajs"].tolist())
+        else:
+            raw_f = cache / "thirdparty" / "boxoban_unfilt_train_000.txt"
+            raw_f.parent.mkdir(parents=True, exist_ok=True)
+            if not raw_f.exists():
+                url = "https://raw.githubusercontent.com/google-deepmind/boxoban-levels/master/unfiltered/train/000.txt"
+                print(f"[data] downloading {url} ...")
+                urllib.request.urlretrieve(url, raw_f)
+            lines = raw_f.read_text(encoding="utf-8").splitlines()
+            lvs, cur = [], []
+            for ln in lines:
+                if ln.startswith(";"):
+                    if len(cur) == 10: lvs.append(cur)
+                    cur = []
+                elif len(ln) >= 10: cur.append(ln[:10])
+            if len(cur) == 10: lvs.append(cur)
+            BWL, BGL, BBL, BPL, BTL, BOL, BTR = [], [], [], [], [], [], []
+            t0 = time.time()
+            for idx_lv, grid in enumerate(lvs[:args.boxoban_train]):
+                w = np.zeros(100, dtype=bool); g = np.zeros(100, dtype=bool); b = np.zeros(100, dtype=bool); pl = -1
+                for rr in range(10):
+                    for cc in range(10):
+                        ch = grid[rr][cc]; ii = rr * 10 + cc
+                        if ch == "#": w[ii] = True
+                        if ch in (".", "*", "+"): g[ii] = True
+                        if ch in ("$", "*"): b[ii] = True
+                        if ch in ("@", "+"): pl = ii
+                if pl >= 0 and b.sum() == g.sum() == 4:
+                    olen, acts, path = astar_solve(10, 10, w, g, b, pl, node_cap=50_000)
+                    if olen > 0:
+                        BWL.append(w); BGL.append(g); BBL.append(b); BPL.append(pl)
+                        BTL.append(4); BOL.append(olen)
+                        BTR.append((np.array(acts, dtype=np.int8), np.stack([x[0] for x in path]),
+                                    np.array([x[1] for x in path], dtype=np.int64)))
+                if (idx_lv + 1) % 200 == 0:
+                    print(f"[data] boxoban A* solved {len(BWL)}/{idx_lv+1} ({time.time()-t0:.1f}s)", flush=True)
+            BWL, BGL, BBL, BPL = np.array(BWL), np.array(BGL), np.array(BBL), np.array(BPL)
+            BTL, BOL = np.array(BTL, dtype=np.int8), np.array(BOL, dtype=np.int32)
+            np.savez_compressed(bf, walls=BWL, goals=BGL, boxes=BBL, players=BPL, tiers=BTL, opt_lens=BOL, trajs=np.array(BTR, dtype=object))
+        pool_tr = SokoPool(10, 10,
+                           np.concatenate([pool_tr.walls, BWL]), np.concatenate([pool_tr.goals, BGL]),
+                           np.concatenate([pool_tr.boxes, BBL]), np.concatenate([pool_tr.players, BPL]),
+                           np.concatenate([pool_tr.t, BTL]), np.concatenate([pool_tr.opt_lens, BOL]),
+                           pool_tr.trajs + BTR)
+        print(f"[data] merged {len(BWL)} A*-solved official Boxoban train levels (avg opt={BOL.mean():.1f}, total={len(pool_tr)})")
     pool_te = build_pool(args.seed + 50_000, args.test_per_tier, args.size, args.size, "test", cache)
     tr_sigs = {d4_canonical_sig(args.size, args.size, pool_tr.walls[i], pool_tr.goals[i],
                                  pool_tr.boxes[i], pool_tr.players[i]) for i in range(len(pool_tr))}
