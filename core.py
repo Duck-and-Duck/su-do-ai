@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Shared domain-agnostic AGI core: QK-Norm HyperGraphBlock, RelationalReasoner, Muon+AdamW, EMA."""
+"""Shared AGI Core v7.0.0: QK-Norm HyperGraph, Focusing Belief, Equivariant Latent World Model."""
 from __future__ import annotations
 import math, os, random
 from contextlib import nullcontext
@@ -82,7 +82,6 @@ def ece(conf, correct, bins=10):
 
 
 class SelfAttnSet(nn.Module):
-    """Permutation-equivariant attention with QK-Norm & CUDA >32768 gridDim chunking."""
     def __init__(self, C, heads, qk_norm=True):
         super().__init__()
         self.h = heads; self.dk = C // heads; self.qk_norm = qk_norm
@@ -143,6 +142,9 @@ class HyperGraphBlock(nn.Module):
 
 
 class RelationalReasoner(nn.Module):
+    """Domain-agnostic reasoner with:
+    1) Contractive belief-feedback + focusing temperature annealing
+    2) Equivariant Learned Latent World Model: imagine_step(z, action_mask) -> (z', logits', val', dead')"""
     def __init__(self, n_nodes, unit_groups_cfg, feat_tie_idx, C=96, heads=4, L=3, T_max=24, T_cyc=8, qk_norm=True):
         super().__init__()
         self.N, self.C, self.L, self.T_max, self.T_cyc = n_nodes, C, L, T_max, T_cyc
@@ -162,6 +164,7 @@ class RelationalReasoner(nn.Module):
             if is_part:
                 self.register_buffer(f"inv_{name}", torch.argsort(flat))
             self.unit_meta.append((name, attn_key, weight, is_part))
+
         self.Win = nn.Parameter(torch.randn(f_uniq, C) * (1.0 / math.sqrt(f_uniq)))
         self.bin = nn.Parameter(torch.zeros(C))
         self.inp = nn.Linear(C, C)
@@ -176,11 +179,32 @@ class RelationalReasoner(nn.Module):
         self.value = nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, 1))
         self.conf = nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, 1))
 
-    def forward_features(self, f, legal_bool, T=6, ckpt=False, all_steps=False, state=None, step_off=0, noise_std=0.0):
-        unit_specs = [(ak, w, getattr(self, f"ug_{nm}"),
-                       (getattr(self, f"inv_{nm}") if isp else None),
-                       getattr(self, f"ud_{nm}"))
-                      for nm, ak, w, isp in self.unit_meta]
+        # Equivariant Learned Latent World Model (UniZero / MuZero dynamics)
+        self.act_emb = nn.Linear(1, C, bias=False)
+        self.dyn_blk = HyperGraphBlock(C, heads, attn_names, qk_norm=qk_norm)
+        self.dyn_norm = nn.LayerNorm(C, eps=1e-5)
+        self.dead_head = nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, 1))
+
+    def _unit_specs(self):
+        return [(ak, w, getattr(self, f"ug_{nm}"),
+                 (getattr(self, f"inv_{nm}") if isp else None),
+                 getattr(self, f"ud_{nm}"))
+                for nm, ak, w, isp in self.unit_meta]
+
+    def _predict_from_z(self, z):
+        c = self.lnc(z.mean(2))
+        gsum = c.mean(1)
+        return (
+            self.head(z).squeeze(-1).float(),
+            self.cand(z).squeeze(-1).float(),
+            self.value(gsum).squeeze(-1).float(),
+            self.conf(gsum).squeeze(-1).float(),
+            self.dead_head(gsum).squeeze(-1).float(),
+        )
+
+    def forward_features(self, f, legal_bool, T=6, ckpt=False, all_steps=False, state=None,
+                         step_off=0, noise_std=0.0, focus_temp=1.0):
+        unit_specs = self._unit_specs()
         has_leg = legal_bool.any(-1, keepdim=True).float()
         W = self.Win[self.fidx]
         h0 = self.inp(F.gelu(torch.einsum("bnkf,fc->bnkc", f, W) + self.bin))
@@ -189,7 +213,9 @@ class RelationalReasoner(nn.Module):
         else:
             h, lg_prev = state
         if noise_std > 0.0:
-            h = h + noise_std * torch.randn_like(h)
+            # Relative noise scaled to actual latent std so PTRM actually escapes basins
+            h_std = h.detach().std(dim=(-2, -1), keepdim=True).clamp(min=0.5)
+            h = h + noise_std * h_std * torch.randn_like(h)
         alpha = torch.sigmoid(self.step_gate)
         outs = []
         for t in range(T):
@@ -197,7 +223,8 @@ class RelationalReasoner(nn.Module):
             if t > 0 or state is not None:
                 y_fb = 0
                 if lg_prev is not None:
-                    y_t = torch.softmax(lg_prev.masked_fill(~legal_bool, -1e4), dim=-1) * has_leg
+                    # Focusing candidate-set softmax: anneal concentration by focus_temp
+                    y_t = torch.softmax((lg_prev / max(focus_temp, 0.25)).masked_fill(~legal_bool, -1e4), dim=-1) * has_leg
                     y_fb = self.y_proj(y_t.to(h.dtype).unsqueeze(-1))
                 h = (1.0 - alpha) * h + alpha * (h0 + y_fb) + self.step_emb[ti]
             else:
@@ -211,13 +238,19 @@ class RelationalReasoner(nn.Module):
             if all_steps or t == T - 1:
                 outs.append(lg_prev)
         z = self.lnf(h)
-        c = self.lnc(z.mean(2))
-        gsum = c.mean(1)
+        _, cand_lg, val_lg, conf_lg, dead_lg = self._predict_from_z(z)
         return dict(logits=outs[-1], logits_all=torch.stack(outs),
-                    cand=self.cand(z).squeeze(-1).float(),
-                    value=self.value(gsum).squeeze(-1).float(),
-                    conf=self.conf(gsum).squeeze(-1).float(),
-                    _h=h, _lg=lg_prev)
+                    cand=cand_lg, value=val_lg, conf=conf_lg, dead=dead_lg,
+                    _h=h, _lg=lg_prev, _z=z)
+
+    def imagine_step(self, z, act_mask):
+        """Pure latent transition: (z, action_1hot (B,N,K)) -> (z_next, logits, value, conf, dead).
+        Zero hardcoded domain rules called! 100% G-equivariant."""
+        unit_specs = self._unit_specs()
+        z_in = z + self.act_emb(act_mask.to(z.dtype).unsqueeze(-1))
+        z_next = self.dyn_norm(z + self.dyn_blk(z_in, unit_specs))
+        lg, cand, val, conf, dead = self._predict_from_z(z_next)
+        return dict(z=z_next, logits=lg, cand=cand, value=val, conf=conf, dead=dead)
 
     @torch.no_grad()
     def logit_bound(self):
@@ -233,75 +266,53 @@ def newton_schulz5(G, steps=5, eps=1e-7):
     X = G.float()
     X = X / (X.norm() + eps)
     transposed = X.size(0) > X.size(1)
-    if transposed:
-        X = X.T
+    if transposed: X = X.T
     for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * (A @ A)
-        X = a * X + B @ X
+        A = X @ X.T; B = b * A + c * (A @ A); X = a * X + B @ X
     return X.T if transposed else X
 
 
 class MuonAdamW:
     def __init__(self, model, lr_muon=0.02, lr_adam=3e-4, momentum=0.95, wd=0.01, ns_steps=5):
-        self.ns = ns_steps
-        muon_p, adam_p = [], []
+        self.ns = ns_steps; muon_p, adam_p = [], []
         for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
+            if not p.requires_grad: continue
             hidden2d = p.ndim == 2 and min(p.shape) >= 8 and not any(
-                k in name for k in ("Win", "head", "cand", "step_emb", "value", "conf", "inp", "y_proj"))
+                k in name for k in ("Win", "head", "cand", "step_emb", "value", "conf", "dead_head", "inp", "y_proj", "act_emb"))
             (muon_p if hidden2d else adam_p).append(p)
         self.muon_p, self.adam_p = muon_p, adam_p
         self.buf = {p: torch.zeros_like(p) for p in muon_p}
         self.opt = torch.optim.AdamW(adam_p, lr=lr_adam, betas=(0.9, 0.95), eps=1e-8, weight_decay=wd)
-        self.lr_muon, self.mom, self.wd = lr_muon, momentum, wd
-        self._adam_lr = lr_adam
-        self.stats = {}
+        self.lr_muon, self.mom, self.wd = lr_muon, momentum, wd; self._adam_lr = lr_adam; self.stats = {}
 
     def zero_grad(self):
-        for p in self.muon_p + self.adam_p:
-            p.grad = None
+        for p in self.muon_p + self.adam_p: p.grad = None
 
     @torch.no_grad()
     def step(self, lr_scale=1.0):
         smax, smin, n = 0.0, 1e9, 0
         for p in self.muon_p:
-            if p.grad is None:
-                continue
-            g = p.grad
-            buf = self.buf[p]
-            buf.mul_(self.mom).add_(g)
-            u = g.add(buf, alpha=self.mom)
-            o = newton_schulz5(u, self.ns)
-            scale = 0.2 * math.sqrt(max(p.shape))
-            p.mul_(1 - self.lr_muon * lr_scale * self.wd)
-            p.add_(o, alpha=-self.lr_muon * lr_scale * scale)
+            if p.grad is None: continue
+            g = p.grad; buf = self.buf[p]; buf.mul_(self.mom).add_(g); u = g.add(buf, alpha=self.mom)
+            o = newton_schulz5(u, self.ns); scale = 0.2 * math.sqrt(max(p.shape))
+            p.mul_(1 - self.lr_muon * lr_scale * self.wd); p.add_(o, alpha=-self.lr_muon * lr_scale * scale)
             if random.random() < 0.05:
-                s = torch.linalg.svdvals(o.float())
-                smax = max(smax, s.max().item()); smin = min(smin, s.min().item()); n += 1
-        for pg in self.opt.param_groups:
-            pg["lr"] = self._adam_lr * lr_scale
+                s = torch.linalg.svdvals(o.float()); smax = max(smax, s.max().item()); smin = min(smin, s.min().item()); n += 1
+        for pg in self.opt.param_groups: pg["lr"] = self._adam_lr * lr_scale
         self.opt.step()
-        self.stats = dict(muon_sigma_max=(smax if n else None),
-                          muon_sigma_min=(smin if n else None), muon_sampled=n)
+        self.stats = dict(muon_sigma_max=(smax if n else None), muon_sigma_min=(smin if n else None), muon_sampled=n)
 
-    def set_lrs(self, lr_muon, adam_lr):
-        self.lr_muon, self._adam_lr = lr_muon, adam_lr
+    def set_lrs(self, lr_muon, adam_lr): self.lr_muon, self._adam_lr = lr_muon, adam_lr
 
 
 class EMA:
     def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.steps = 0
+        self.decay = decay; self.steps = 0
         self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
     @torch.no_grad()
     def update(self, model):
-        self.steps += 1
-        d = min(self.decay, (1.0 + self.steps) / (10.0 + self.steps))
+        self.steps += 1; d = min(self.decay, (1.0 + self.steps) / (10.0 + self.steps))
         for k, v in model.state_dict().items():
-            if v.dtype.is_floating_point:
-                self.shadow[k].mul_(d).add_(v.detach(), alpha=1.0 - d)
-            else:
-                self.shadow[k].copy_(v)
+            if v.dtype.is_floating_point: self.shadow[k].mul_(d).add_(v.detach(), alpha=1.0 - d)
+            else: self.shadow[k].copy_(v)

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Zero-Shot Third-Party Benchmark: sapientinc/sudoku-extreme & DeepMind Boxoban"""
+"""Zero-Shot Third-Party Benchmark: sapientinc/sudoku-extreme (FocusDiff, PTRM, WM-Tree, Sys2)"""
 import csv, io, json, time, urllib.request
 from pathlib import Path
 import numpy as np
 import torch
 import sudoku_ai as su
-import sokoban_ai as sk
 
 OUT = Path("runs/thirdparty"); CACHE = Path("cache/thirdparty")
 OUT.mkdir(parents=True, exist_ok=True); CACHE.mkdir(parents=True, exist_ok=True)
@@ -38,7 +37,7 @@ def load_sudoku_extreme(n=200):
     return P, S, C
 
 
-def run_sudoku(ckpt_path="runs/sudoku_v6/weights.pt", n=200, n_sys2=100, sim_nodes=32):
+def run_sudoku(ckpt_path="runs/sudoku_v7/weights.pt", n=200, n_sub=100, sim_nodes=32):
     print("\n" + "=" * 78 + f"\nZERO-SHOT BENCHMARK: sapientinc/sudoku-extreme ({ckpt_path})\n" + "=" * 78, flush=True)
     P, S, C = load_sudoku_extreme(n=n)
     tr_sols = set()
@@ -55,28 +54,42 @@ def run_sudoku(ckpt_path="runs/sudoku_v6/weights.pt", n=200, n_sys2=100, sim_nod
     npar = ck["n_params"]
 
     t0 = time.time()
-    fb_ok, _ = su.solve_fullboard(net, P, DEV, n_rounds=6, t_seg=3, n_noisy=1, batch_sz=64)
-    print(f"   [1-Pass FullBoard Sys1 ({time.time()-t0:.1f}s, 0 search, 0 noise)] All={fb_ok.mean()*100:.2f}% | 0-Singles={fb_ok[~is_singles].mean()*100:.2f}%", flush=True)
+    fb_ok, _ = su.solve_focus_diffusion(net, P, DEV, n_rounds=8, t_seg=3, n_noisy=1, batch_sz=64)
+    print(f"   [1. Focusing Diffusion (0 search, {time.time()-t0:.1f}s)]    All={fb_ok.mean()*100:.2f}% | 0-Singles={fb_ok[~is_singles].mean()*100:.2f}%", flush=True)
 
     t1 = time.time()
-    ptrm_ok, _ = su.solve_fullboard(net, P, DEV, n_rounds=6, t_seg=3, n_noisy=32, noise_std=0.20, batch_sz=8)
-    print(f"   [PTRM K=32 Latent ({time.time()-t1:.1f}s, 0 tree search)]          All={ptrm_ok.mean()*100:.2f}% | 0-Singles={ptrm_ok[~is_singles].mean()*100:.2f}%", flush=True)
+    ptrm_ok, _ = su.solve_focus_diffusion(net, P, DEV, n_rounds=8, t_seg=3, n_noisy=32, noise_std=0.35, batch_sz=8)
+    print(f"   [2. Relative PTRM K=32 (0 search, {time.time()-t1:.1f}s)]   All={ptrm_ok.mean()*100:.2f}% | 0-Singles={ptrm_ok[~is_singles].mean()*100:.2f}%", flush=True)
 
+    # Pure Latent World-Model Tree Imagining (0 Python rules inside imagination!)
     t2 = time.time()
-    s2_ok, s2_sims = [], []
-    for i, p in enumerate(P[:n_sys2]):
+    wm_ok = []
+    for i, p in enumerate(P[:n_sub]):
         if ptrm_ok[i]:
+            wm_ok.append(True)
+        else:
+            ok_w, _ = su.solve_worldmodel_tree(net, p, DEV, T=4, beam_w=3, depth=2)
+            wm_ok.append(ok_w)
+    wm_arr = np.array(wm_ok); ns_sub = ~is_singles[:n_sub]
+    print(f"   [3. Latent WorldModel Tree (0 rules, {time.time()-t2:.1f}s)] All={wm_arr.mean()*100:.2f}% | 0-Singles={wm_arr[ns_sub].mean()*100:.2f}%", flush=True)
+
+    # Full Hybrid Sys1+2
+    t3 = time.time()
+    s2_ok, s2_sims = [], []
+    for i, p in enumerate(P[:n_sub]):
+        if wm_arr[i]:
             s2_ok.append(True); s2_sims.append(0)
         else:
             ok, sims = su.simulate_solve(net, p, DEV, T=4, conf_thresh=0.95, max_sim_nodes=sim_nodes)
             s2_ok.append(ok); s2_sims.append(sims)
         if (i + 1) % 25 == 0:
-            print(f"   [Sys1+2 progress] {i+1}/{n_sys2}: {np.mean(s2_ok)*100:.1f}% ({time.time()-t2:.1f}s)", flush=True)
-    s2_arr = np.array(s2_ok); ns_sub = ~is_singles[:n_sys2]
-    print(f"   [PTRM + Sys2 ({sim_nodes}n, avg {np.mean(s2_sims):.1f} sims)] All={s2_arr.mean()*100:.2f}% | 0-Singles={s2_arr[ns_sub].mean()*100:.2f}%", flush=True)
+            print(f"   [Sys1+2 progress] {i+1}/{n_sub}: {np.mean(s2_ok)*100:.1f}% ({time.time()-t3:.1f}s)", flush=True)
+    s2_arr = np.array(s2_ok)
+    print(f"   [4. Hybrid + Sys2 ({sim_nodes}n, avg {np.mean(s2_sims):.1f} sims)] All={s2_arr.mean()*100:.2f}% | 0-Singles={s2_arr[ns_sub].mean()*100:.2f}%", flush=True)
     print(f"   Params: {npar:,} | Global refs: LLMs 0.0% | HRM(27M) 55.0% | TRM-Att(7M) 74.7% | TRM-MLP(5M) 87.4% | PTRM(7M) 98.75%", flush=True)
-    res = dict(n=len(P), leakage=leak, fullboard_all=float(fb_ok.mean()), fullboard_0s=float(fb_ok[~is_singles].mean()),
+    res = dict(n=len(P), leakage=leak, focus_all=float(fb_ok.mean()), focus_0s=float(fb_ok[~is_singles].mean()),
                ptrm32_all=float(ptrm_ok.mean()), ptrm32_0s=float(ptrm_ok[~is_singles].mean()),
+               wm_tree_all=float(wm_arr.mean()), wm_tree_0s=float(wm_arr[ns_sub].mean()),
                sys2_all=float(s2_arr.mean()), sys2_0s=float(s2_arr[ns_sub].mean()), avg_sims=float(np.mean(s2_sims)))
     (OUT / "thirdparty_results.json").write_text(json.dumps(res, indent=2))
     return res
