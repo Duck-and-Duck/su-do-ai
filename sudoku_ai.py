@@ -34,14 +34,6 @@ from torch.utils.checkpoint import checkpoint as _ckpt
 __version__ = "5.0.2"
 T0 = time.time()
 
-GLOBAL_BASELINES = [
-    ("Frontier LLMs (R1 / o3-mini / Claude 3.7)", "100B-1T+", "1x + CoT", "Unchecked", "0.0% (Sudoku-Extreme)"),
-    ("Direct Transformer (arXiv:2510.04871)", "27M", "1,000x aug", "Unchecked", "0.0% (Sudoku-Extreme)"),
-    ("Sapient HRM (arXiv:2506.21734)", "27M", "Heavy aug", "Unchecked", "55.0% (Sudoku-Extreme)"),
-    ("Samsung TRM-Att (arXiv:2510.04871)", "7M", "1,000x aug", "Unchecked", "74.7% (Sudoku-Extreme)"),
-    ("Samsung TRM-MLP (arXiv:2510.04871)", "5M", "1,000x aug (~36h L40S)", "Unchecked", "87.4% (Sudoku-Extreme)"),
-    ("Probabilistic TRM (PTRM, 2026)", "7M", "Noise + Q-voting", "Unchecked", "98.75% (Sudoku-Extreme)"),
-]
 
 # ==============================================================================
 # §1  EXACT SUDOKU CORE (Task Adapter & Verifier)
@@ -587,10 +579,17 @@ class SelfAttnSet(nn.Module):
 
     def forward(self, x):
         N, S, C = x.shape
-        qkv = self.qkv(x).reshape(N, S, 3, self.h, self.dk).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        o = F.scaled_dot_product_attention(q, k, v)
-        return self.proj(o.transpose(1, 2).reshape(N, S, C))
+        if N <= 32768:
+            qkv = self.qkv(x).reshape(N, S, 3, self.h, self.dk).permute(2, 0, 3, 1, 4)
+            o = F.scaled_dot_product_attention(qkv[0], qkv[1], qkv[2])
+            return self.proj(o.transpose(1, 2).reshape(N, S, C))
+        outs = []
+        for off in range(0, N, 32768):
+            xc = x[off:off + 32768]
+            qkv = self.qkv(xc).reshape(xc.shape[0], S, 3, self.h, self.dk).permute(2, 0, 3, 1, 4)
+            o = F.scaled_dot_product_attention(qkv[0], qkv[1], qkv[2])
+            outs.append(self.proj(o.transpose(1, 2).reshape(xc.shape[0], S, C)))
+        return torch.cat(outs, dim=0)
 
 
 class HyperGraphBlock(nn.Module):
@@ -1059,7 +1058,7 @@ def simulate_solve(net, puzzle, device, T=4, conf_thresh=0.95, max_sim_nodes=48)
                         uncertain_pts.append(entry)
                     else:
                         fallback_pts.append(entry)
-            if temp == 0.0 and best_p >= 0.997:
+            if temp == 0.0 and best_p >= 0.999:
                 cur[best_i] = best_d + 1
                 committed = 1
                 for i2 in empt:
@@ -1070,7 +1069,7 @@ def simulate_solve(net, puzzle, device, T=4, conf_thresh=0.95, max_sim_nodes=48)
                     ex2 = np.exp(li2 - li2.max()) * m2
                     pr2 = ex2 / ex2.sum()
                     d2 = int(pr2.argmax())
-                    if pr2[d2] >= 0.997 and cur[i2] == 0 and not (cur[PEERS[i2]] == d2 + 1).any():
+                    if pr2[d2] >= 0.999 and cur[i2] == 0 and not (cur[PEERS[i2]] == d2 + 1).any():
                         cur[i2] = d2 + 1
                         committed += 1
             else:
@@ -1079,7 +1078,8 @@ def simulate_solve(net, puzzle, device, T=4, conf_thresh=0.95, max_sim_nodes=48)
 
     def push_from_trace(u_pts, f_pts, max_fb=6):
         fb = sorted(f_pts, key=lambda x: x[0], reverse=True)[-max_fb:]
-        for _p, b_snap, cell, alts, pr in (fb + u_pts):
+        # Push reversed u_pts on top so earliest uncertain mistake (u_pts[0]) pops FIRST
+        for _p, b_snap, cell, alts, pr in (fb + list(reversed(u_pts))):
             children, priors = [], []
             for d in alts:
                 cb = b_snap.copy()
@@ -1609,15 +1609,20 @@ def train(args, device, out_dir: Path, pool_tr, resume_ck=None):
             t_it = time.time()
             try:
                 if phase == "ssl" or (it % args.ssl_every == args.ssl_every - 1):
-                    n_h = int(round(args.ssl_batch * 0.70))
-                    idx = np.concatenate([pool_tr.sample(rng, args.ssl_batch - n_h),
-                                          pool_tr.sample_hard(rng, n_h)])
+                    if args.train_csv_n > 0:
+                        n_h = int(round(args.ssl_batch * 0.80))
+                        idx = np.concatenate([pool_tr.sample(rng, args.ssl_batch - n_h),
+                                              pool_tr.sample(rng, n_h, tier=5)])
+                    else:
+                        n_h = int(round(args.ssl_batch * 0.70))
+                        idx = np.concatenate([pool_tr.sample(rng, args.ssl_batch - n_h),
+                                              pool_tr.sample_hard(rng, n_h)])
                     sol = pool_tr.s[idx]
                     pz = pool_tr.p[idx]
                     is_hard = pool_tr.t[idx] >= 3
                     mode = rng.random()
-                    if mode < 0.30:
-                        keep = rng.random((len(idx), 81)) > rng.uniform(0.20, 0.85)
+                    if mode < (0.15 if args.train_csv_n > 0 else 0.30):
+                        keep = rng.random((len(idx), 81)) > rng.uniform(0.25, 0.78)
                         b = np.where(keep, sol, 0).astype(np.int8)
                     else:
                         b = pz.copy()
@@ -1625,7 +1630,10 @@ def train(args, device, out_dir: Path, pool_tr, resume_ck=None):
                             empt = np.where(b[j] == 0)[0]
                             if len(empt) > 0:
                                 rng.shuffle(empt)
-                                hi = max(1, len(empt) // 3) if (is_hard[j] and rng.random() < 0.6) else len(empt)
+                                if args.train_csv_n > 0 and is_hard[j]:
+                                    hi = max(1, min(8, len(empt) // 5)) if rng.random() < 0.7 else max(1, len(empt) // 2)
+                                else:
+                                    hi = max(1, len(empt) // 3) if (is_hard[j] and rng.random() < 0.6) else len(empt)
                                 nfill = int(rng.integers(0, hi))
                                 b[j, empt[:nfill]] = sol[j, empt[:nfill]]
                     bt = torch.as_tensor(b, dtype=torch.long, device=device)
@@ -1829,18 +1837,6 @@ def write_report(out, args, proofs, npar, it, peak, ev, sweep_easy, sweep_hard, 
         A(f"| {d['name']} | {d['n_puzzles']} | {d['clues']:.1f} | "
           f"{d['greedy_pass1']:.3f} | {d['pass_at_1']:.3f} | {d['pass_at_2']:.3f} | "
           f"**{s2}** | {sims} | {d['digit_ece']:.3f} | {d['dead_rate']:.3f} |")
-
-    A("\n## 4. Comparison vs. Global Meta Models\n")
-    A("| Model | Params | Data / Aug | Legality | Hard / Extreme Score |\n|---|---|---|---|---|")
-    for name, prm, aug, leg, sc in GLOBAL_BASELINES:
-        A(f"| {name} | {prm} | {aug} | {leg} | {sc} |")
-    hard_tiers = [d for t, d in ev.get("tiers", {}).items() if int(t) >= 3]
-    if hard_tiers:
-        hn = sum(d["n_puzzles"] for d in hard_tiers)
-        s1_hard = sum(d["greedy_pass1"] * d["n_puzzles"] for d in hard_tiers) / max(1, hn)
-        s2_hard = sum(d.get("sys2_pass", d["greedy_pass1"]) * d["n_puzzles"] for d in hard_tiers) / max(1, hn)
-        A(f"| **Sudoku-AGI v{__version__} (Sys1 / Sys1+2)** | **{npar:,}** | **1x (exact G-equivariant)** | "
-          f"**0% illegal (P6)** | **{s1_hard*100:.1f}% Sys1 / {s2_hard*100:.1f}% Sys1+2 (T3-T5, n={hn})** |")
 
     if gap:
         A("\n### Memorisation control (TRAIN vs TEST)\n")
