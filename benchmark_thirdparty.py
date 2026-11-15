@@ -80,7 +80,7 @@ def parse_boxoban_file(url, cache_name, limit=100):
     return np.array(WL), np.array(GL), np.array(BL), np.array(PL)
 
 
-def run_sudoku_benchmark(ckpt_path="runs/extreme_v5_1/weights.pt", n=200, n_sys2=100, sim_nodes=24):
+def run_sudoku_benchmark(ckpt_path=("runs/extreme_v5_1/weights.pt" if Path("runs/extreme_v5_1/weights.pt").exists() else "runs/rtx3050_v5_2/weights.pt"), n=200, n_sys2=100, sim_nodes=24):
     print("\n" + "=" * 78 + "\nTHIRD-PARTY BENCHMARK 1: sapientinc/sudoku-extreme (Official Test Split)\n" + "=" * 78, flush=True)
     P, S, C = load_sudoku_extreme(n=n)
     tr_sols = set()
