@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Shared AGI Core v7.0.0: QK-Norm HyperGraph, Focusing Belief, Equivariant Latent World Model."""
+"""Shared AGI Core v8.0.0: QK-Norm HyperGraph, Unmasked/Masked Focusing, Equivariant World Model."""
 from __future__ import annotations
 import math, os, random
 from contextlib import nullcontext
@@ -142,9 +142,6 @@ class HyperGraphBlock(nn.Module):
 
 
 class RelationalReasoner(nn.Module):
-    """Domain-agnostic reasoner with:
-    1) Contractive belief-feedback + focusing temperature annealing
-    2) Equivariant Learned Latent World Model: imagine_step(z, action_mask) -> (z', logits', val', dead')"""
     def __init__(self, n_nodes, unit_groups_cfg, feat_tie_idx, C=96, heads=4, L=3, T_max=24, T_cyc=8, qk_norm=True):
         super().__init__()
         self.N, self.C, self.L, self.T_max, self.T_cyc = n_nodes, C, L, T_max, T_cyc
@@ -179,7 +176,6 @@ class RelationalReasoner(nn.Module):
         self.value = nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, 1))
         self.conf = nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, 1))
 
-        # Equivariant Learned Latent World Model (UniZero / MuZero dynamics)
         self.act_emb = nn.Linear(1, C, bias=False)
         self.dyn_blk = HyperGraphBlock(C, heads, attn_names, qk_norm=qk_norm)
         self.dyn_norm = nn.LayerNorm(C, eps=1e-5)
@@ -202,10 +198,9 @@ class RelationalReasoner(nn.Module):
             self.dead_head(gsum).squeeze(-1).float(),
         )
 
-    def forward_features(self, f, legal_bool, T=6, ckpt=False, all_steps=False, state=None,
+    def forward_features(self, f, legal_bool=None, T=6, ckpt=False, all_steps=False, state=None,
                          step_off=0, noise_std=0.0, focus_temp=1.0):
         unit_specs = self._unit_specs()
-        has_leg = legal_bool.any(-1, keepdim=True).float()
         W = self.Win[self.fidx]
         h0 = self.inp(F.gelu(torch.einsum("bnkf,fc->bnkc", f, W) + self.bin))
         if state is None:
@@ -213,18 +208,22 @@ class RelationalReasoner(nn.Module):
         else:
             h, lg_prev = state
         if noise_std > 0.0:
-            # Relative noise scaled to actual latent std so PTRM actually escapes basins
             h_std = h.detach().std(dim=(-2, -1), keepdim=True).clamp(min=0.5)
             h = h + noise_std * h_std * torch.randn_like(h)
         alpha = torch.sigmoid(self.step_gate)
+        if legal_bool is not None:
+            has_leg = legal_bool.any(-1, keepdim=True).float()
         outs = []
         for t in range(T):
             ti = (step_off + t) % self.T_cyc
             if t > 0 or state is not None:
                 y_fb = 0
                 if lg_prev is not None:
-                    # Focusing candidate-set softmax: anneal concentration by focus_temp
-                    y_t = torch.softmax((lg_prev / max(focus_temp, 0.25)).masked_fill(~legal_bool, -1e4), dim=-1) * has_leg
+                    scaled = lg_prev / max(focus_temp, 0.25)
+                    if legal_bool is not None:
+                        y_t = torch.softmax(scaled.masked_fill(~legal_bool, -1e4), dim=-1) * has_leg
+                    else:
+                        y_t = torch.softmax(scaled, dim=-1)
                     y_fb = self.y_proj(y_t.to(h.dtype).unsqueeze(-1))
                 h = (1.0 - alpha) * h + alpha * (h0 + y_fb) + self.step_emb[ti]
             else:
@@ -244,8 +243,6 @@ class RelationalReasoner(nn.Module):
                     _h=h, _lg=lg_prev, _z=z)
 
     def imagine_step(self, z, act_mask):
-        """Pure latent transition: (z, action_1hot (B,N,K)) -> (z_next, logits, value, conf, dead).
-        Zero hardcoded domain rules called! 100% G-equivariant."""
         unit_specs = self._unit_specs()
         z_in = z + self.act_emb(act_mask.to(z.dtype).unsqueeze(-1))
         z_next = self.dyn_norm(z + self.dyn_blk(z_in, unit_specs))
@@ -263,8 +260,7 @@ class RelationalReasoner(nn.Module):
 @torch.no_grad()
 def newton_schulz5(G, steps=5, eps=1e-7):
     a, b, c = 3.4445, -4.7750, 2.0315
-    X = G.float()
-    X = X / (X.norm() + eps)
+    X = G.float(); X = X / (X.norm() + eps)
     transposed = X.size(0) > X.size(1)
     if transposed: X = X.T
     for _ in range(steps):

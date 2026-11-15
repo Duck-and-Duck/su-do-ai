@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zero-Shot Third-Party Benchmark: sapientinc/sudoku-extreme (FocusDiff, PTRM, WM-Tree, Sys2)"""
+"""Zero-Shot Third-Party Benchmark: sapientinc/sudoku-extreme (Clean Standalone Modes)"""
 import csv, io, json, time, urllib.request
 from pathlib import Path
 import numpy as np
@@ -13,8 +13,7 @@ DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_sudoku_extreme(n=200):
     f = CACHE / f"sudoku_extreme_test_{n}.npz"
-    if f.exists():
-        z = np.load(f); return z["p"], z["s"], z["clues"]
+    if f.exists(): z = np.load(f); return z["p"], z["s"], z["clues"]
     url = "https://huggingface.co/datasets/sapientinc/sudoku-extreme/resolve/main/test.csv"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     P, S, C = [], [], []
@@ -37,7 +36,7 @@ def load_sudoku_extreme(n=200):
     return P, S, C
 
 
-def run_sudoku(ckpt_path="runs/sudoku_v7/weights.pt", n=200, n_sub=100, sim_nodes=32):
+def run_sudoku(ckpt_path="runs/sudoku_v8/weights.pt", n=200, n_sub=50, sim_nodes=16):
     print("\n" + "=" * 78 + f"\nZERO-SHOT BENCHMARK: sapientinc/sudoku-extreme ({ckpt_path})\n" + "=" * 78, flush=True)
     P, S, C = load_sudoku_extreme(n=n)
     tr_sols = set()
@@ -49,47 +48,31 @@ def run_sudoku(ckpt_path="runs/sudoku_v7/weights.pt", n=200, n_sub=100, sim_node
     print(f"[data] n={len(P)} | clues avg={C.mean():.1f} ({C.min()}..{C.max()}) | 0-singles={(~is_singles).sum()}/{len(P)} | leakage={leak}/{len(P)}", flush=True)
 
     ck = torch.load(ckpt_path, map_location=DEV, weights_only=False); sa = ck["args"]
-    net = su.SudokuNet(C=sa["width"], heads=sa["heads"], L=sa["layers"], qk_norm=bool(sa.get("qk_norm", False))).to(DEV).eval()
+    net = su.SudokuNet(C=sa["width"], heads=sa["heads"], L=sa["layers"], qk_norm=bool(sa.get("qk_norm", True))).to(DEV).eval()
     net.load_state_dict({k: v for k, v in ck["model"].items() if not k.startswith(("ug_", "ud_", "inv_"))}, strict=False)
     npar = ck["n_params"]
 
     t0 = time.time()
     fb_ok, _ = su.solve_focus_diffusion(net, P, DEV, n_rounds=8, t_seg=3, n_noisy=1, batch_sz=64)
-    print(f"   [1. Focusing Diffusion (0 search, {time.time()-t0:.1f}s)]    All={fb_ok.mean()*100:.2f}% | 0-Singles={fb_ok[~is_singles].mean()*100:.2f}%", flush=True)
+    print(f"   [1. Standalone FocusDiff (0 search, {time.time()-t0:.1f}s)]   All={fb_ok.mean()*100:.2f}% | 0-Singles={fb_ok[~is_singles].mean()*100:.2f}%", flush=True)
 
     t1 = time.time()
     ptrm_ok, _ = su.solve_focus_diffusion(net, P, DEV, n_rounds=8, t_seg=3, n_noisy=32, noise_std=0.35, batch_sz=8)
-    print(f"   [2. Relative PTRM K=32 (0 search, {time.time()-t1:.1f}s)]   All={ptrm_ok.mean()*100:.2f}% | 0-Singles={ptrm_ok[~is_singles].mean()*100:.2f}%", flush=True)
+    print(f"   [2. Standalone PTRM K=32 (0 tree, {time.time()-t1:.1f}s)]     All={ptrm_ok.mean()*100:.2f}% | 0-Singles={ptrm_ok[~is_singles].mean()*100:.2f}%", flush=True)
 
-    # Pure Latent World-Model Tree Imagining (0 Python rules inside imagination!)
     t2 = time.time()
-    wm_ok = []
-    for i, p in enumerate(P[:n_sub]):
-        if ptrm_ok[i]:
-            wm_ok.append(True)
-        else:
-            ok_w, _ = su.solve_worldmodel_tree(net, p, DEV, T=4, beam_w=3, depth=2)
-            wm_ok.append(ok_w)
+    wm_ok = [bool(su.solve_worldmodel_tree(net, p, DEV, T=4, beam_w=3, depth=2)[0]) for p in P[:n_sub]]
     wm_arr = np.array(wm_ok); ns_sub = ~is_singles[:n_sub]
-    print(f"   [3. Latent WorldModel Tree (0 rules, {time.time()-t2:.1f}s)] All={wm_arr.mean()*100:.2f}% | 0-Singles={wm_arr[ns_sub].mean()*100:.2f}%", flush=True)
+    print(f"   [3. Standalone WM-Tree (n={n_sub}, 0 rules in imag, {time.time()-t2:.1f}s)] All={wm_arr.mean()*100:.2f}% | 0-Singles={wm_arr[ns_sub].mean()*100:.2f}%", flush=True)
 
-    # Full Hybrid Sys1+2
     t3 = time.time()
-    s2_ok, s2_sims = [], []
-    for i, p in enumerate(P[:n_sub]):
-        if wm_arr[i]:
-            s2_ok.append(True); s2_sims.append(0)
-        else:
-            ok, sims = su.simulate_solve(net, p, DEV, T=4, conf_thresh=0.95, max_sim_nodes=sim_nodes)
-            s2_ok.append(ok); s2_sims.append(sims)
-        if (i + 1) % 25 == 0:
-            print(f"   [Sys1+2 progress] {i+1}/{n_sub}: {np.mean(s2_ok)*100:.1f}% ({time.time()-t3:.1f}s)", flush=True)
-    s2_arr = np.array(s2_ok)
-    print(f"   [4. Hybrid + Sys2 ({sim_nodes}n, avg {np.mean(s2_sims):.1f} sims)] All={s2_arr.mean()*100:.2f}% | 0-Singles={s2_arr[ns_sub].mean()*100:.2f}%", flush=True)
-    print(f"   Params: {npar:,} | Global refs: LLMs 0.0% | HRM(27M) 55.0% | TRM-Att(7M) 74.7% | TRM-MLP(5M) 87.4% | PTRM(7M) 98.75%", flush=True)
+    s2 = [su.simulate_solve(net, p, DEV, T=4, conf_thresh=0.95, max_sim_nodes=sim_nodes) for p in P[:n_sub]]
+    s2_arr = np.array([x[0] for x in s2]); s2_sims = [x[1] for x in s2]
+    print(f"   [4. Neuro-Symbolic Sys2 (n={n_sub}, {sim_nodes}n, avg {np.mean(s2_sims):.1f}s, {time.time()-t3:.1f}s)] All={s2_arr.mean()*100:.2f}% | 0-Singles={s2_arr[ns_sub].mean()*100:.2f}%", flush=True)
+    print(f"   Params: {npar:,} (RAW-OBS, 0 benchmark training, 0 leakage)", flush=True)
     res = dict(n=len(P), leakage=leak, focus_all=float(fb_ok.mean()), focus_0s=float(fb_ok[~is_singles].mean()),
                ptrm32_all=float(ptrm_ok.mean()), ptrm32_0s=float(ptrm_ok[~is_singles].mean()),
-               wm_tree_all=float(wm_arr.mean()), wm_tree_0s=float(wm_arr[ns_sub].mean()),
+               wm_tree_standalone_all=float(wm_arr.mean()), wm_tree_standalone_0s=float(wm_arr[ns_sub].mean()),
                sys2_all=float(s2_arr.mean()), sys2_0s=float(s2_arr[ns_sub].mean()), avg_sims=float(np.mean(s2_sims)))
     (OUT / "thirdparty_results.json").write_text(json.dumps(res, indent=2))
     return res
