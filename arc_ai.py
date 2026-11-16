@@ -2,13 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- ARC-AGI-1 v4.0.0 : Fast CompressARC-Style Joint-Demo Equivariant MDL (0 CrossAttn)
+ ARC-AGI-1 v5.0.0 : Object-Aware D4xS9 Equivariant ELBO + Shape-Routed MDL
 ================================================================================
-Runs in ~2-3 minutes on n=100 official ARC-AGI-1 eval tasks (~1.5s/task, 160 steps).
-Directly compresses all D demo pairs (in_k -> out_k) into a tiny 38K S9xD4 HyperGraph.
+Fixes all v4 defects:
+  1. D4SymConv2d (exact 3-ring symmetric conv) + Row/Col SelfAttnSet (fast)
+  2. Real object/CC + 4/8-neighbor features (area, largest/smallest/unique/rect)
+  3. Exact shape routing: SAME_HW / INT_SCALE (repeat_interleave) / CROP / GLOBAL
+  4. Variational KL bottleneck + consistent D4 multi-view + demos_fit hard filter
 """
 from __future__ import annotations
 import argparse, json, time, urllib.request, zipfile
+from collections import deque
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,9 +21,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from core import amp_ctx, HyperGraphBlock
+from core import amp_ctx, SelfAttnSet
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 ARC_ZIP_URL = "https://github.com/fchollet/ARC-AGI/archive/refs/heads/master.zip"
 
 
@@ -36,148 +40,326 @@ def load_arc_eval(cache_dir: Path):
 
 
 @lru_cache(maxsize=512)
-def _unit_specs_hw(H: int, W: int, dev_str: str):
+def _hw_cache(H: int, W: int, dev_str: str):
     dev = torch.device(dev_str); N = H * W
-    row_u = torch.arange(N, dtype=torch.long, device=dev).reshape(H, W)
-    col_u = row_u.t().contiguous()
-    patches = [[max(0, min(H - 1, r + dr)) * W + max(0, min(W - 1, c + dc))
-                for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
-               for r in range(H) for c in range(W)]
-    pat_u = torch.tensor(patches, dtype=torch.long, device=dev)
-    specs = []
-    for ak, w, ti in [("line", 0.5, row_u), ("line", 0.5, col_u), ("patch", 1.0, pat_u)]:
-        flat = ti.reshape(-1)
-        deg = torch.bincount(flat, minlength=N).float().clamp(min=1.0).view(1, N, 1, 1)
-        isp = (flat.numel() == N) and bool((torch.bincount(flat, minlength=N) == 1).all())
-        inv = torch.argsort(flat) if isp else None
-        specs.append((ak, w, ti, inv, deg))
     rr = torch.linspace(-1.0, 1.0, H, device=dev)[:, None].expand(H, W).reshape(N)
     cc = torch.linspace(-1.0, 1.0, W, device=dev)[None, :].expand(H, W).reshape(N)
-    coords = torch.stack([rr, cc, rr.abs(), cc.abs()], dim=-1)
-    return specs, coords
+    coords = torch.stack([rr, cc, rr.abs(), cc.abs()], dim=-1)  # (N, 4)
+    return coords
 
 
-def infer_output_shape(demos, test_in):
-    th, tw = len(test_in), len(test_in[0])
-    in_s = [(len(d["input"]), len(d["input"][0])) for d in demos]
-    out_s = [(len(d["output"]), len(d["output"][0])) for d in demos]
-    if all(i == o for i, o in zip(in_s, out_s)): return th, tw
-    if len(set(out_s)) == 1: return out_s[0]
-    rh = [o[0] / i[0] for i, o in zip(in_s, out_s)]; rw = [o[1] / i[1] for i, o in zip(in_s, out_s)]
-    if max(rh) - min(rh) < 1e-6 and max(rw) - min(rw) < 1e-6:
-        return max(1, min(30, int(round(th * rh[0])))), max(1, min(30, int(round(tw * rw[0]))))
-    return out_s[0]
+def extract_object_features(grid_2d: np.ndarray) -> np.ndarray:
+    """Real per-cell neighbor + connected-component object features: (H*W, 9) float32."""
+    H, W = grid_2d.shape; N = H * W
+    feats = np.zeros((H, W, 9), dtype=np.float32)
+    # 0,1: 4-neighbor & 8-neighbor same-color counts
+    for r in range(H):
+        for c in range(W):
+            col = grid_2d[r, c]
+            n4 = sum(1 for dr, dc in ((-1,0),(1,0),(0,-1),(0,1))
+                     if 0 <= r+dr < H and 0 <= c+dc < W and grid_2d[r+dr, c+dc] == col)
+            n8 = sum(1 for dr in (-1,0,1) for dc in (-1,0,1)
+                     if (dr or dc) and 0 <= r+dr < H and 0 <= c+dc < W and grid_2d[r+dr, c+dc] == col)
+            feats[r, c, 0] = n4 / 4.0
+            feats[r, c, 1] = n8 / 8.0
+    # 2..8: 4-connected foreground components per color
+    vis = np.zeros((H, W), dtype=bool)
+    comps = []
+    for r in range(H):
+        for c in range(W):
+            if grid_2d[r, c] != 0 and not vis[r, c]:
+                col = grid_2d[r, c]; q = deque([(r, c)]); vis[r, c] = True; cells = []
+                r0 = r1 = r; c0 = c1 = c
+                while q:
+                    cr, cc = q.popleft(); cells.append((cr, cc))
+                    r0 = min(r0, cr); r1 = max(r1, cr); c0 = min(c0, cc); c1 = max(c1, cc)
+                    for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+                        nr, nc = cr + dr, cc + dc
+                        if 0 <= nr < H and 0 <= nc < W and not vis[nr, nc] and grid_2d[nr, nc] == col:
+                            vis[nr, nc] = True; q.append((nr, nc))
+                comps.append((cells, len(cells), r0, r1, c0, c1))
+    if comps:
+        areas = [x[1] for x in comps]
+        mx_a, mn_a = max(areas), min(areas)
+        from collections import Counter
+        acnt = Counter(areas)
+        for cells, area, r0, r1, c0, c1 in comps:
+            bh = (r1 - r0 + 1) / H; bw = (c1 - c0 + 1) / W
+            solid = float(area == (r1 - r0 + 1) * (c1 - c0 + 1))
+            is_max = float(area == mx_a); is_min = float(area == mn_a); is_uniq = float(acnt[area] == 1)
+            for cr, cc in cells:
+                feats[cr, cc, 2] = area / N
+                feats[cr, cc, 3] = is_max
+                feats[cr, cc, 4] = is_min
+                feats[cr, cc, 5] = is_uniq
+                feats[cr, cc, 6] = solid
+                feats[cr, cc, 7] = bh
+                feats[cr, cc, 8] = bw
+    return feats.reshape(N, 9)
 
 
-def align_in(in_2d, Ho: int, Wo: int, device):
-    t = torch.as_tensor(in_2d, dtype=torch.float32, device=device)[None, None]
-    return F.interpolate(t, size=(Ho, Wo), mode="nearest")[0, 0].long().reshape(-1)
+def find_subgrid_mask(in_g: np.ndarray, out_g: np.ndarray):
+    hi, wi = in_g.shape; ho, wo = out_g.shape
+    if ho > hi or wo > wi: return None
+    for r0 in range(hi - ho + 1):
+        for c0 in range(wi - wo + 1):
+            if np.array_equal(in_g[r0:r0+ho, c0:c0+wo], out_g):
+                m = np.zeros((hi, wi), dtype=np.float32)
+                m[r0:r0+ho, c0:c0+wo] = 1.0
+                return m.reshape(-1)
+    return None
 
 
-class TinyCompressARC(nn.Module):
-    """~38K-param D4 x S9 HyperGraph compressor fit per task directly on demo (in -> out) pairs."""
+def detect_task_mode(demos, test_in):
+    in_s = [np.asarray(d["input"]).shape for d in demos]
+    out_s = [np.asarray(d["output"]).shape for d in demos]
+    if all(i == o for i, o in zip(in_s, out_s)):
+        return "SAME_HW", (1, 1), None
+    if all(o[0] % i[0] == 0 and o[1] % i[1] == 0 for i, o in zip(in_s, out_s)):
+        rh = [o[0] // i[0] for i, o in zip(in_s, out_s)]
+        rw = [o[1] // i[1] for i, o in zip(in_s, out_s)]
+        if len(set(rh)) == 1 and len(set(rw)) == 1:
+            return "INT_SCALE", (rh[0], rw[0]), None
+    crop_masks = [find_subgrid_mask(np.asarray(d["input"]), np.asarray(d["output"])) for d in demos]
+    if all(m is not None for m in crop_masks):
+        return "CROP", (1, 1), crop_masks
+    if len(set(out_s)) == 1:
+        return "CONST_GLOBAL", out_s[0], None
+    return "CONST_GLOBAL", out_s[0], None
+
+
+class D4SymConv2d(nn.Module):
+    """Exact D4-equivariant 3x3 conv (center + ortho + diag = 3 weights/channel) in 1 F.conv2d call."""
+    def __init__(self, C):
+        super().__init__()
+        self.wc = nn.Parameter(torch.randn(C, C) * (0.5 / math.sqrt(C)))
+        self.wo = nn.Parameter(torch.randn(C, C) * (0.25 / math.sqrt(C)))
+        self.wd = nn.Parameter(torch.randn(C, C) * (0.25 / math.sqrt(C)))
+        mc = torch.zeros(3, 3); mc[1, 1] = 1.0
+        mo = torch.tensor([[0.,1.,0.],[1.,0.,1.],[0.,1.,0.]])
+        md = torch.tensor([[1.,0.,1.],[0.,0.,0.],[1.,0.,1.]])
+        self.register_buffer("mc", mc); self.register_buffer("mo", mo); self.register_buffer("md", md)
+
+    def forward(self, x_bkhw):
+        w = (self.wc[:, :, None, None] * self.mc +
+             self.wo[:, :, None, None] * self.mo +
+             self.wd[:, :, None, None] * self.md)
+        return F.conv2d(x_bkhw, w, padding=1)
+
+
+class FastARCBlock(nn.Module):
+    def __init__(self, C, heads):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(C, eps=1e-5)
+        self.conv = D4SymConv2d(C)
+        self.attn_line = SelfAttnSet(C, heads, qk_norm=True)  # tied row <-> col!
+        self.ln2 = nn.LayerNorm(C, eps=1e-5)
+        self.attn_slot = SelfAttnSet(C, heads, qk_norm=True)  # K=10 colors
+        self.ln3 = nn.LayerNorm(C, eps=1e-5)
+        self.mlp = nn.Sequential(nn.Linear(C, 2 * C), nn.GELU(), nn.Linear(2 * C, C))
+
+    def forward(self, h, H: int, W: int):
+        B, N, K, C = h.shape
+        u = self.ln1(h)
+        # 1) D4-symmetric local 3x3 conv
+        uc = u.permute(0, 2, 3, 1).reshape(B * K, C, H, W)
+        oc = self.conv(uc).reshape(B, K, C, N).permute(0, 3, 1, 2)
+        # 2) Tied Row <-> Col attention
+        g = u.reshape(B, H, W, K, C)
+        orow = self.attn_line(g.permute(0, 1, 3, 2, 4).reshape(B * H * K, W, C)).reshape(B, H, K, W, C).permute(0, 1, 3, 2, 4).reshape(B, N, K, C)
+        ocol = self.attn_line(g.permute(0, 2, 3, 1, 4).reshape(B * W * K, H, C)).reshape(B, W, K, H, C).permute(0, 3, 1, 2, 4).reshape(B, N, K, C)
+        h = h + oc + 0.5 * (orow + ocol)
+        h = h + self.attn_slot(self.ln2(h).reshape(B * N, K, C)).reshape(B, N, K, C)
+        h = h + self.mlp(self.ln3(h))
+        return h
+
+
+class ARCCompNet(nn.Module):
+    """Fast D4xS9 Equivariant Object-Aware Network with Variational KL Bottleneck."""
     def __init__(self, C=32, heads=4, L=2):
         super().__init__()
-        self.Win = nn.Linear(8, C)
+        self.Win = nn.Linear(16, C)
         self.color_bias = nn.Parameter(torch.zeros(10, C))
-        self.blocks = nn.ModuleList([HyperGraphBlock(C, heads, ["line", "patch"], qk_norm=True) for _ in range(L)])
+        self.mu_proj = nn.Linear(C, C); self.lv_proj = nn.Linear(C, C)
+        self.blocks = nn.ModuleList([FastARCBlock(C, heads) for _ in range(L)])
         self.lnf = nn.LayerNorm(C, eps=1e-5)
-        self.head = nn.Linear(C, 1)
+        self.pix_head = nn.Linear(C, 1)
+        self.crop_head = nn.Linear(C, 1)
+        self.global_dec = nn.Sequential(nn.Linear(2 * C + 4, C), nn.GELU(), nn.Linear(C, 10))
 
-    def forward(self, in_aligned_batch, Ho: int, Wo: int, T=2):
-        # in_aligned_batch: (B, Ho*Wo)
-        B, N = in_aligned_batch.shape
-        specs, coords = _unit_specs_hw(Ho, Wo, str(in_aligned_batch.device))
-        in_oh = F.one_hot(in_aligned_batch, 10).float()             # (B, N, 10)
-        is_z = torch.zeros(B, N, 10, device=in_aligned_batch.device); is_z[:, :, 0] = 1.0
+    def build_features(self, grids_np_list, obj_feats_list, device):
+        B = len(grids_np_list); H, W = grids_np_list[0].shape; N = H * W
+        coords = _hw_cache(H, W, str(device))
+        gt = torch.as_tensor(np.stack([g.reshape(-1) for g in grids_np_list]), dtype=torch.long, device=device)
+        ob = torch.as_tensor(np.stack(obj_feats_list), dtype=torch.float32, device=device)  # (B, N, 9)
+        in_oh = F.one_hot(gt, 10).float()
+        is_z = torch.zeros(B, N, 10, device=device); is_z[:, :, 0] = 1.0
         hist = in_oh.mean(dim=1, keepdim=True).expand(B, N, 10)
+        ob10 = ob.unsqueeze(2).expand(B, N, 10, 9)
         c4 = coords.view(1, N, 1, 4).expand(B, N, 10, 4)
-        # Same-color neighbor match count (local object boundary detector)
-        f = torch.cat([in_oh.unsqueeze(-1), is_z.unsqueeze(-1), hist.unsqueeze(-1),
-                       (in_oh > 0.5).float().unsqueeze(-1), c4], dim=-1)  # (B, N, 10, 8)
+        return torch.cat([in_oh.unsqueeze(-1), is_z.unsqueeze(-1), hist.unsqueeze(-1), ob10, c4], dim=-1)  # (B, N, 10, 16)
+
+    def forward(self, f, H: int, W: int, sample_z=True):
         h0 = F.gelu(self.Win(f)) + self.color_bias.view(1, 1, 10, -1)
-        h = h0
-        for _ in range(T):
-            h = 0.5 * h + 0.5 * h0
-            for blk in self.blocks:
-                h = blk(h, specs)
-        return self.head(self.lnf(h)).squeeze(-1).float()  # (B, N, 10)
+        mu = self.mu_proj(h0); lv = self.lv_proj(h0).clamp(-8.0, 2.0)
+        kl = -0.5 * (1.0 + lv - mu.pow(2) - lv.exp()).mean()
+        h = (mu + torch.randn_like(mu) * torch.exp(0.5 * lv)) if (sample_z and self.training) else mu
+        for blk in self.blocks:
+            h = blk(h, H, W)
+        z = self.lnf(h)
+        pix_lg = self.pix_head(z).squeeze(-1).float()       # (B, N, 10)
+        crop_lg = self.crop_head(z.mean(2)).squeeze(-1).float()  # (B, N)
+        return pix_lg, crop_lg, z, kl
+
+    def decode_global(self, z, Ho: int, Wo: int):
+        B = z.shape[0]; zm = z.mean(2)  # (B, N_in, C)
+        g = torch.cat([zm.mean(1), zm.amax(1)], dim=-1)  # (B, 2*C)
+        coords_o = _hw_cache(Ho, Wo, str(z.device))
+        inp = torch.cat([g.unsqueeze(1).expand(B, Ho * Wo, -1), coords_o.unsqueeze(0).expand(B, Ho * Wo, 4)], dim=-1)
+        return self.global_dec(inp).float()  # (B, Ho*Wo, 10)
 
 
-def solve_task_mdl(task, device, steps=160, C=32, L=2):
-    demos = task["train"]
-    test_in = np.asarray(task["test"][0]["input"], dtype=np.int64)
-    Ho_test, Wo_test = infer_output_shape(demos, test_in)
+def apply_d4(g, k_rot: int, flip: bool):
+    a = np.asarray(g, dtype=np.int64)
+    if k_rot: a = np.rot90(a, k_rot)
+    if flip: a = np.fliplr(a)
+    return a.copy()
 
-    # Group demos by output (Ho, Wo) for instant batched GPU steps
-    by_hw = {}
-    for d in demos:
-        di = np.asarray(d["input"], dtype=np.int64)
-        do = np.asarray(d["output"], dtype=np.int64)
-        hw = do.shape
-        by_hw.setdefault(hw, []).append((align_in(di, hw[0], hw[1], device),
-                                         torch.as_tensor(do.reshape(-1), dtype=torch.long, device=device)))
-    batches = [(hw[0], hw[1], torch.stack([x[0] for x in lst]), torch.stack([x[1] for x in lst]))
-               for hw, lst in by_hw.items()]
 
-    torch.manual_seed(0)
-    net = TinyCompressARC(C=C, heads=4, L=L).to(device)
-    opt = torch.optim.AdamW(net.parameters(), lr=8e-3, weight_decay=0.04)  # MDL bottleneck!
+def inv_d4(g, k_rot: int, flip: bool):
+    a = np.asarray(g, dtype=np.int64)
+    if flip: a = np.fliplr(a)
+    if k_rot: a = np.rot90(a, 4 - k_rot)
+    return a.copy()
+
+
+def run_single_view(task, k_rot: int, flip: bool, device, steps=160, C=32, L=2):
+    demos = [{"input": apply_d4(d["input"], k_rot, flip), "output": apply_d4(d["output"], k_rot, flip)} for d in task["train"]]
+    test_in = apply_d4(task["test"][0]["input"], k_rot, flip)
+    mode, param, crop_masks = detect_task_mode(demos, test_in)
+
+    # Precompute inputs/targets per demo (grouped by input (Hi, Wi))
+    by_in_hw = {}
+    for idx_d, d in enumerate(demos):
+        di, do = d["input"], d["output"]
+        if mode == "INT_SCALE":
+            di_use = np.repeat(np.repeat(di, param[0], axis=0), param[1], axis=1)
+        else:
+            di_use = di
+        hw = di_use.shape
+        ob = extract_object_features(di_use)
+        tgt_out = torch.as_tensor(do.reshape(-1), dtype=torch.long, device=device)
+        tgt_crop = torch.as_tensor(crop_masks[idx_d], dtype=torch.float32, device=device) if mode == "CROP" else None
+        by_in_hw.setdefault(hw, []).append((di_use, ob, tgt_out, do.shape, tgt_crop))
+
+    groups = []
+    net = ARCCompNet(C=C, heads=4, L=L).to(device)
+    for hw, lst in by_in_hw.items():
+        f_b = net.build_features([x[0] for x in lst], [x[1] for x in lst], device).detach()
+        groups.append((hw[0], hw[1], f_b, lst))
+
+    opt = torch.optim.AdamW(net.parameters(), lr=1.2e-2, weight_decay=0.02)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
-
     net.train()
-    solved_demos = False
+    demos_fit = False
+    best_loss = 1e9
     for st in range(steps):
-        opt.zero_grad()
-        tot_l = 0.0; exact_all = True
-        for Ho, Wo, xin, ygt in batches:
+        opt.zero_grad(); tot_l = 0.0; all_ok = True
+        for Hi, Wi, f_b, lst in groups:
             with amp_ctx(device):
-                lg = net(xin, Ho, Wo, T=2)
-                loss = F.cross_entropy(lg.reshape(-1, 10), ygt.reshape(-1))
-            tot_l = tot_l + loss / len(batches)
-            if not bool((lg.argmax(-1) == ygt).all()):
-                exact_all = False
-        tot_l.backward()
-        opt.step(); sched.step()
-        if exact_all and st >= 40:
-            solved_demos = True
-            # keep training briefly for MDL margin, or break early
-            if st >= 80:
-                break
+                pix_lg, crop_lg, z, kl = net(f_b, Hi, Wi, sample_z=(st < steps - 15))
+                if mode in ("SAME_HW", "INT_SCALE"):
+                    ygt = torch.stack([x[2] for x in lst])
+                    loss_g = F.cross_entropy(pix_lg.reshape(-1, 10), ygt.reshape(-1))
+                    all_ok &= bool((pix_lg.argmax(-1) == ygt).all())
+                elif mode == "CROP":
+                    cm = torch.stack([x[4] for x in lst])
+                    loss_g = F.binary_cross_entropy_with_logits(crop_lg, cm)
+                    all_ok &= bool(((crop_lg > 0) == (cm > 0.5)).all())
+                else:  # CONST_GLOBAL
+                    Ho, Wo = param
+                    glg = net.decode_global(z, Ho, Wo)
+                    ygt = torch.stack([x[2] for x in lst])
+                    loss_g = F.cross_entropy(glg.reshape(-1, 10), ygt.reshape(-1))
+                    all_ok &= bool((glg.argmax(-1) == ygt).all())
+                tot_l = tot_l + (loss_g + 0.02 * kl) / len(groups)
+        tot_l.backward(); opt.step(); sched.step()
+        lv = float(tot_l.detach())
+        if lv < best_loss: best_loss = lv
+        if all_ok:
+            demos_fit = True
+            if st >= 75: break
 
     net.eval()
     with torch.no_grad(), amp_ctx(device):
-        t_al = align_in(test_in, Ho_test, Wo_test, device).unsqueeze(0)
-        lg_t = net(t_al, Ho_test, Wo_test, T=2)[0]
-        pred = lg_t.argmax(-1).cpu().numpy().reshape(Ho_test, Wo_test)
-    return pred, solved_demos
+        ti_use = np.repeat(np.repeat(test_in, param[0], axis=0), param[1], axis=1) if mode == "INT_SCALE" else test_in
+        f_t = net.build_features([ti_use], [extract_object_features(ti_use)], device)
+        pix_t, crop_t, z_t, _ = net(f_t, ti_use.shape[0], ti_use.shape[1], sample_z=False)
+        if mode in ("SAME_HW", "INT_SCALE"):
+            pred = pix_t[0].argmax(-1).cpu().numpy().reshape(ti_use.shape)
+        elif mode == "CROP":
+            cm_p = (crop_t[0].cpu().numpy().reshape(ti_use.shape) > 0)
+            if cm_p.any():
+                rs, cs = np.where(cm_p)
+                pred = ti_use[rs.min():rs.max()+1, cs.min():cs.max()+1].copy()
+            else:
+                pred = ti_use
+        else:
+            Ho, Wo = param
+            pred = net.decode_global(z_t, Ho, Wo)[0].argmax(-1).cpu().numpy().reshape(Ho, Wo)
+    return inv_d4(pred, k_rot, flip), demos_fit, best_loss
+
+
+def solve_task(task, device, steps=160):
+    """Consistent 4x D4 multi-view + demos_fit precision filter -> pass@2."""
+    fit_cands, all_cands = {}, {}
+    any_fit = False
+    for k_rot in range(4):
+        pred, d_fit, loss_v = run_single_view(task, k_rot, False, device, steps=steps)
+        key = (pred.shape, pred.tobytes())
+        all_cands[key] = (all_cands.get(key, (0, pred))[0] + 1, pred)
+        if d_fit:
+            any_fit = True
+            fit_cands[key] = (fit_cands.get(key, (0, pred))[0] + 1, pred)
+    pool = fit_cands if fit_cands else all_cands
+    ranked = sorted(pool.values(), key=lambda x: x[0], reverse=True)
+    top2 = [x[1] for x in ranked[:2]]
+    if len(top2) == 1: top2.append(top2[0])
+    return top2, any_fit
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tasks", type=int, default=100)
+    ap.add_argument("--tasks", type=int, default=50)
     ap.add_argument("--steps", type=int, default=160)
-    ap.add_argument("--out", default="runs/arc_v4")
+    ap.add_argument("--out", default="runs/arc_v5")
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     eval_tasks = load_arc_eval(Path("cache/thirdparty"))
     keys = sorted(eval_tasks.keys())[:args.tasks]
-    print(f"ARC-AGI-1 v4.0.0 (Pure CompressARC-style 38K HyperGraph MDL, 0 pretraining) | n={len(keys)} tasks | {dev}", flush=True)
 
-    p1 = 0; demo_fit = 0; t0 = time.time(); solved_ids = []
+    # Honest speed check on 2 tasks first
+    t_b = time.time()
+    for tid in keys[:2]: solve_task(eval_tasks[tid], dev, steps=args.steps)
+    sec_per_task = (time.time() - t_b) / 2.0
+    print(f"ARC-AGI-1 v5.0.0 | Measured speed: {sec_per_task:.2f}s/task (~{sec_per_task*len(keys)/60:.1f} min for {len(keys)} tasks) | {dev}", flush=True)
+
+    p1 = p2 = fit_cnt = 0; t0 = time.time(); solved_ids = []
     for i, tid in enumerate(keys):
         tk = eval_tasks[tid]
-        pred, d_ok = solve_task_mdl(tk, dev, steps=args.steps)
+        top2, d_fit = solve_task(tk, dev, steps=args.steps)
         true_out = np.asarray(tk["test"][0]["output"], dtype=np.int64)
-        ok = (pred.shape == true_out.shape and np.array_equal(pred, true_out))
-        p1 += int(ok); demo_fit += int(d_ok)
-        if ok: solved_ids.append(tid)
+        ok1 = (top2[0].shape == true_out.shape and np.array_equal(top2[0], true_out))
+        ok2 = ok1 or (top2[1].shape == true_out.shape and np.array_equal(top2[1], true_out))
+        p1 += int(ok1); p2 += int(ok2); fit_cnt += int(d_fit)
+        if ok2: solved_ids.append(tid)
         if (i + 1) % 10 == 0:
-            print(f"   [{i+1:3d}/{len(keys)}] exact_pass={p1/(i+1)*100:5.1f}% ({p1}/{i+1}) | demos_fit={demo_fit}/{i+1} ({time.time()-t0:.1f}s)", flush=True)
+            print(f"   [{i+1:3d}/{len(keys)}] pass@1={p1/(i+1)*100:5.1f}% pass@2={p2/(i+1)*100:5.1f}% ({p2}/{i+1}) | demos_fit={fit_cnt}/{i+1} ({time.time()-t0:.1f}s)", flush=True)
 
-    print(f"\n[FINAL WITHOUT PRETRAINING] n={len(keys)} | pass@1={p1/len(keys)*100:.2f}% ({p1}/{len(keys)}) | solved={solved_ids}", flush=True)
-    (out / "arc_v4_results.json").write_text(json.dumps(dict(n=len(keys), pass1=p1/len(keys), solved_ids=solved_ids, demo_fit=demo_fit), indent=2))
+    print(f"\n[FINAL WITHOUT PRETRAINING] n={len(keys)} | pass@1={p1/len(keys)*100:.2f}% | pass@2={p2/len(keys)*100:.2f}% ({p2}/{len(keys)}) | demos_fit={fit_cnt}/{len(keys)}", flush=True)
+    print(f"   Solved IDs: {solved_ids}", flush=True)
+    (out / "arc_v5_results.json").write_text(json.dumps(dict(n=len(keys), pass1=p1/len(keys), pass2=p2/len(keys), demos_fit=fit_cnt, solved_ids=solved_ids), indent=2))
 
 
 if __name__ == "__main__":
