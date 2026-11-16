@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from core import SelfAttnSet
 
-__version__ = "5.0.0"
+__version__ = "5.0.1"
 ARC_ZIP_URL = "https://github.com/fchollet/ARC-AGI/archive/refs/heads/master.zip"
 
 
@@ -267,7 +267,7 @@ def run_single_view(task, k_rot: int, flip: bool, device, steps=120, C=32, L=2):
 
 def solve_task(task, device, steps=120):
     fit_cands, all_cands = {}, {}; any_fit = False
-    for k_rot in range(4):
+    for k_rot in range(2):
         pred, d_fit = run_single_view(task, k_rot, False, device, steps=steps)
         key = (pred.shape, pred.tobytes())
         all_cands[key] = (all_cands.get(key, (0, pred))[0] + 1, pred)
@@ -283,8 +283,8 @@ def solve_task(task, device, steps=120):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tasks", type=int, default=50)
-    ap.add_argument("--steps", type=int, default=120)
+    ap.add_argument("--tasks", type=int, default=25)
+    ap.add_argument("--steps", type=int, default=100)
     ap.add_argument("--out", default="runs/arc_v5")
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
