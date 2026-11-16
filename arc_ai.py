@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from core import SelfAttnSet
 
-__version__ = "5.0.1"
+__version__ = "5.0.2"
 ARC_ZIP_URL = "https://github.com/fchollet/ARC-AGI/archive/refs/heads/master.zip"
 
 
@@ -213,7 +213,7 @@ def run_single_view(task, k_rot: int, flip: bool, device, steps=120, C=32, L=2):
         hw = di_use.shape; ob = extract_object_features(di_use)
         tgt_out = torch.as_tensor(do.reshape(-1), dtype=torch.long, device=device)
         tgt_crop = torch.as_tensor(crop_masks[idx_d], dtype=torch.float32, device=device) if mode == "CROP" else None
-        by_in_hw.setdefault(hw, []).append((di_use, ob, tgt_out, tgt_crop))
+        by_in_hw.setdefault(hw, []).append((di_use, ob, tgt_out, tgt_crop, do.shape))
 
     torch.manual_seed(k_rot)
     net = ARCCompNet(C=C, heads=4, L=L).to(device)
@@ -238,9 +238,13 @@ def run_single_view(task, k_rot: int, flip: bool, device, steps=120, C=32, L=2):
                 loss_g = F.binary_cross_entropy_with_logits(crop_lg, cm)
                 all_ok &= bool(((crop_lg > 0) == (cm > 0.5)).all())
             else:
-                Ho, Wo = param; glg = net.decode_global(z, Ho, Wo); ygt = torch.stack([x[2] for x in lst])
-                loss_g = F.cross_entropy(glg.reshape(-1, 10), ygt.reshape(-1))
-                all_ok &= bool((glg.argmax(-1) == ygt).all())
+                loss_g = 0.0
+                for k_i, item in enumerate(lst):
+                    ho_i, wo_i = item[4]
+                    glg = net.decode_global(z[k_i:k_i+1], ho_i, wo_i)
+                    ygt_i = item[2].unsqueeze(0)
+                    loss_g = loss_g + F.cross_entropy(glg.reshape(-1, 10), ygt_i.reshape(-1)) / len(lst)
+                    all_ok &= bool((glg.argmax(-1) == ygt_i).all())
             tot_l = tot_l + (loss_g + 0.015 * kl) / len(groups)
         tot_l.backward(); opt.step(); sched.step()
         if all_ok:
@@ -306,7 +310,7 @@ def main():
         ok2 = ok1 or (top2[1].shape == true_out.shape and np.array_equal(top2[1], true_out))
         p1 += int(ok1); p2 += int(ok2); fit_cnt += int(d_fit)
         if ok2: solved_ids.append(tid)
-        if (i + 1) % 10 == 0:
+        if (i + 1) % 5 == 0:
             print(f"   [{i+1:3d}/{len(keys)}] pass@1={p1/(i+1)*100:5.1f}% pass@2={p2/(i+1)*100:5.1f}% ({p2}/{i+1}) | demos_fit={fit_cnt}/{i+1} ({time.time()-t0:.1f}s)", flush=True)
 
     print(f"\n[FINAL WITHOUT PRETRAINING] n={len(keys)} | pass@1={p1/len(keys)*100:.2f}% | pass@2={p2/len(keys)*100:.2f}% ({p2}/{len(keys)}) | demos_fit={fit_cnt}/{len(keys)}", flush=True)
