@@ -36,7 +36,7 @@ def load_sudoku_extreme(n=200):
     return P, S, C
 
 
-def run_sudoku(ckpt_path="runs/sudoku_v8/weights.pt", n=200, n_sub=50, sim_nodes=16):
+def run_sudoku(ckpt_path="runs/sudoku_v8_1/weights.pt", n=200, n_sub=50, sim_nodes=16):
     print("\n" + "=" * 78 + f"\nZERO-SHOT BENCHMARK: sapientinc/sudoku-extreme ({ckpt_path})\n" + "=" * 78, flush=True)
     P, S, C = load_sudoku_extreme(n=n)
     tr_sols = set()
@@ -68,7 +68,7 @@ def run_sudoku(ckpt_path="runs/sudoku_v8/weights.pt", n=200, n_sub=50, sim_nodes
     t3 = time.time()
     s2 = [su.simulate_solve(net, p, DEV, T=4, conf_thresh=0.95, max_sim_nodes=sim_nodes) for p in P[:n_sub]]
     s2_arr = np.array([x[0] for x in s2]); s2_sims = [x[1] for x in s2]
-    print(f"   [4. Neuro-Symbolic Sys2 (n={n_sub}, {sim_nodes}n, avg {np.mean(s2_sims):.1f}s, {time.time()-t3:.1f}s)] All={s2_arr.mean()*100:.2f}% | 0-Singles={s2_arr[ns_sub].mean()*100:.2f}%", flush=True)
+    print(f"   [4. Neuro-Symbolic Sys2 (n={n_sub}, {sim_nodes}n, avg {np.mean(s2_sims):.1f} sims, {time.time()-t3:.1f}s)] All={s2_arr.mean()*100:.2f}% | 0-Singles={s2_arr[ns_sub].mean()*100:.2f}%", flush=True)
     print(f"   Params: {npar:,} (RAW-OBS, 0 benchmark training, 0 leakage)", flush=True)
     res = dict(n=len(P), leakage=leak, focus_all=float(fb_ok.mean()), focus_0s=float(fb_ok[~is_singles].mean()),
                ptrm32_all=float(ptrm_ok.mean()), ptrm32_0s=float(ptrm_ok[~is_singles].mean()),

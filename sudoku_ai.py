@@ -20,7 +20,7 @@ from core import (
     pass_at_k, wilson, ece, RelationalReasoner, MuonAdamW, EMA, newton_schulz5
 )
 
-__version__ = "8.0.0"
+__version__ = "8.1.0"
 T0 = time.time()
 
 # ==============================================================================
@@ -468,9 +468,11 @@ def world_model_loss(net, bt, giv, st):
     l_cos2 = (1.0 - F.cosine_similarity(im2["z"], z2_tgt, dim=-1)).mean()
     l_dead = 0.5 * (F.binary_cross_entropy_with_logits(im1["dead"], dead1) +
                     F.binary_cross_entropy_with_logits(im2["dead"], dead2))
+    l_coll = 0.5 * (F.binary_cross_entropy_with_logits(im1["coll"], dead1) +
+                    F.binary_cross_entropy_with_logits(im2["coll"], dead2))
     l_val = 0.5 * (F.binary_cross_entropy_with_logits(im1["value"], 1.0 - dead1) +
                    F.binary_cross_entropy_with_logits(im2["value"], 1.0 - dead2))
-    return l_cos1 + l_cos2 + 0.5 * (l_dead + l_val), float(1.0 - l_cos1.detach()), float(l_dead.detach())
+    return l_cos1 + l_cos2 + 0.6 * (l_dead + l_coll + l_val), float(1.0 - l_cos1.detach()), float(l_coll.detach())
 
 
 @torch.no_grad()
@@ -539,7 +541,7 @@ def solve_worldmodel_tree(net, puzzle, device, T=4, beam_w=3, depth=2):
                 am2 = torch.zeros(len(top_cands), 81, 9, device=device)
                 am2[torch.arange(len(top_cands), device=device), p1 // 9, p1 % 9] = 1.0
                 im2 = net.imagine_step(im1["z"], am2)
-                q_vals = (torch.sigmoid(im2["value"]) * (1.0 - torch.sigmoid(im2["dead"]))).cpu().numpy()
+                q_vals = (torch.sigmoid(im2["value"]) * (1.0 - torch.sigmoid(im1["coll"])) * (1.0 - torch.sigmoid(im2["dead"])) - 0.2 * (im1["ens_var"] + im2["ens_var"])).cpu().numpy()
             else:
                 q_vals = (torch.sigmoid(im1["value"]) * (1.0 - torch.sigmoid(im1["dead"]))).cpu().numpy()
         scores = [0.65 * q_vals[bi] + 0.35 * top_cands[bi][0] for bi in range(len(top_cands))]
@@ -689,7 +691,7 @@ def inspect_imagination(net, device, seed=2026):
     print(f"IMAGINATION INSPECTOR: Easiest Unique Incomplete Puzzle ({clues} clues, {81-clues} blanks, unique=1)")
     print("=" * 78)
     print(f"Inspecting empty cell r{cell//9+1}c{cell%9+1} (true unique digit = {true_d+1}):")
-    print(f"   Digit | Legal? | Policy p | Imagined V(z') | Imagined Dead(z') | Latent Cos(z_imag, real_next)")
+    print(f"   Digit | Legal? | Policy p | Imagined V(z') | Coll(act) | Dead(z') | Latent Cos")
     rows = []
     for d in range(9):
         am = torch.zeros(1, 81, 9, device=device); am[0, cell, d] = 1.0
@@ -699,11 +701,12 @@ def inspect_imagination(net, device, seed=2026):
             z_real = net(torch.as_tensor(b_real[None], dtype=torch.long, device=device), giv, T=2)["_z"]
         cos_sim = float(F.cosine_similarity(im["z"], z_real, dim=-1).mean())
         val_i = float(torch.sigmoid(im["value"])[0])
+        coll_i = float(torch.sigmoid(im["coll"])[0])
         dead_i = float(torch.sigmoid(im["dead"])[0])
         is_leg = bool(legal_mask_np(puz)[cell, d])
         tag = " <-- TRUE" if d == true_d else (" (conflict)" if not is_leg else "")
-        print(f"     {d+1}   |  {'YES' if is_leg else 'no '}   |  {probs0[d]:.3f}   |      {val_i:.3f}       |       {dead_i:.3f}       |            {cos_sim:.3f}{tag}")
-        rows.append(dict(digit=d+1, legal=is_leg, true=(d==true_d), policy=float(probs0[d]), val=val_i, dead=dead_i, cos=cos_sim))
+        print(f"     {d+1}   |  {'YES' if is_leg else 'no '}   |  {probs0[d]:.3f}   |      {val_i:.3f}       |   {coll_i:.3f}   |   {dead_i:.3f}   |   {cos_sim:.3f}{tag}")
+        rows.append(dict(digit=d+1, legal=is_leg, true=(d==true_d), policy=float(probs0[d]), val=val_i, coll=coll_i, dead=dead_i, cos=cos_sim))
     return dict(clues=int(clues), cell=cell, true_digit=true_d+1, rows=rows)
 
 
@@ -754,7 +757,7 @@ class LevelPuzzleEngine:
 
 
 @torch.no_grad()
-def evaluate(net, pool, device, mdp, n_samples=2, temp=0.8, T=4, per_tier=24, tiers=(1, 2, 3, 4, 5), run_sys2=True, max_sim_nodes=32):
+def evaluate(net, pool, device, mdp, n_samples=2, temp=0.8, T=4, per_tier=24, tiers=(1, 2, 3, 4, 5), run_sys2=True, max_sim_nodes=32, conf_thresh=0.95):
     net.eval(); res = {"T": T, "tiers": {}}
     for t in tiers:
         idx = pool.by_tier.get(t, np.empty(0, int))
@@ -791,7 +794,7 @@ def evaluate(net, pool, device, mdp, n_samples=2, temp=0.8, T=4, per_tier=24, ti
                  greedy_pass1=float(gs.mean()),
                  pass_at_2=float(np.mean([pass_at_k(n_samples, int(c), 2) for c in cnt])) if n_samples else float(gs.mean()))
         if run_sys2:
-            s2 = [simulate_solve(net, p_i, device, T=T, max_sim_nodes=max_sim_nodes) for p_i in pz]
+            s2 = [simulate_solve(net, p_i, device, T=T, conf_thresh=conf_thresh, max_sim_nodes=max_sim_nodes) for p_i in pz]
             d["sys2_pass"] = float(np.mean([x[0] for x in s2])); d["sys2_avg_sims"] = float(np.mean([x[1] for x in s2]))
         res["tiers"][t] = d
     net.train(); return res

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Shared AGI Core v8.0.0: QK-Norm HyperGraph, Unmasked/Masked Focusing, Equivariant World Model."""
+"""Shared AGI Core v8.1.0: QK-Norm HyperGraph, FROG Global-Max Context, 3-Head Ensemble WM."""
 from __future__ import annotations
 import math, os, random
 from contextlib import nullcontext
@@ -135,8 +135,9 @@ class HyperGraphBlock(nn.Module):
                 acc = acc / deg
             msg = msg + weight * acc.to(h.dtype)
         h = h + msg
-        us = self.ln2(h).reshape(B * N, K, C)
-        h = h + self.attn_slot(us).reshape(B, N, K, C)
+        if K > 1:
+            us = self.ln2(h).reshape(B * N, K, C)
+            h = h + self.attn_slot(us).reshape(B, N, K, C)
         h = h + self.mlp(self.ln3(h))
         return h
 
@@ -173,13 +174,18 @@ class RelationalReasoner(nn.Module):
         self.head = nn.Linear(C, 1)
         self.cand = nn.Linear(C, 1)
         self.lnc = nn.LayerNorm(C, eps=1e-5)
+        # FROG v3.2: [mean, amax] global context prevents 1/N dilution of single-cell conflicts!
+        self.pool_proj = nn.Sequential(nn.Linear(2 * C, C), nn.LayerNorm(C, eps=1e-5))
         self.value = nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, 1))
         self.conf = nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, 1))
+        self.dead_head = nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, 1))
 
+        # FROG v3.2: Equivariant 3-Head Ensemble Dynamics + Action-Centered Conflict Head
         self.act_emb = nn.Linear(1, C, bias=False)
         self.dyn_blk = HyperGraphBlock(C, heads, attn_names, qk_norm=qk_norm)
+        self.dyn_deltas = nn.ModuleList([nn.Linear(C, C) for _ in range(3)])
         self.dyn_norm = nn.LayerNorm(C, eps=1e-5)
-        self.dead_head = nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, 1))
+        self.coll_head = nn.Linear(C, 1)
 
     def _unit_specs(self):
         return [(ak, w, getattr(self, f"ug_{nm}"),
@@ -187,9 +193,12 @@ class RelationalReasoner(nn.Module):
                  getattr(self, f"ud_{nm}"))
                 for nm, ak, w, isp in self.unit_meta]
 
+    def _global_ctx(self, z):
+        c = self.lnc(z.mean(2))  # (B, N, C)
+        return self.pool_proj(torch.cat([c.mean(1), c.amax(1)], dim=-1))
+
     def _predict_from_z(self, z):
-        c = self.lnc(z.mean(2))
-        gsum = c.mean(1)
+        gsum = self._global_ctx(z)
         return (
             self.head(z).squeeze(-1).float(),
             self.cand(z).squeeze(-1).float(),
@@ -243,11 +252,18 @@ class RelationalReasoner(nn.Module):
                     _h=h, _lg=lg_prev, _z=z)
 
     def imagine_step(self, z, act_mask):
+        """FROG-upgraded equivariant 3-head ensemble world model + action-centered conflict head."""
         unit_specs = self._unit_specs()
-        z_in = z + self.act_emb(act_mask.to(z.dtype).unsqueeze(-1))
-        z_next = self.dyn_norm(z + self.dyn_blk(z_in, unit_specs))
+        am_f = act_mask.to(z.dtype)
+        z_in = z + self.act_emb(am_f.unsqueeze(-1))
+        d_feat = self.dyn_blk(z_in, unit_specs) - z_in
+        z_ens = torch.stack([self.dyn_norm(z + head(d_feat)) for head in self.dyn_deltas], dim=0)  # (3, B, N, K, C)
+        z_next = z_ens.mean(dim=0)
+        ens_var = z_ens.var(dim=0).mean(dim=(-3, -2, -1)).float()
         lg, cand, val, conf, dead = self._predict_from_z(z_next)
-        return dict(z=z_next, logits=lg, cand=cand, value=val, conf=conf, dead=dead)
+        # Action-centered collision/conflict logit right at the acted (cell, slot) token!
+        coll = (self.coll_head(z_next).squeeze(-1) * am_f).sum(dim=(1, 2)).float()
+        return dict(z=z_next, ens_var=ens_var, logits=lg, cand=cand, value=val, conf=conf, dead=dead, coll=coll)
 
     @torch.no_grad()
     def logit_bound(self):
@@ -274,7 +290,7 @@ class MuonAdamW:
         for name, p in model.named_parameters():
             if not p.requires_grad: continue
             hidden2d = p.ndim == 2 and min(p.shape) >= 8 and not any(
-                k in name for k in ("Win", "head", "cand", "step_emb", "value", "conf", "dead_head", "inp", "y_proj", "act_emb"))
+                k in name for k in ("Win", "head", "cand", "step_emb", "value", "conf", "dead_head", "coll_head", "pool_proj", "inp", "y_proj", "act_emb"))
             (muon_p if hidden2d else adam_p).append(p)
         self.muon_p, self.adam_p = muon_p, adam_p
         self.buf = {p: torch.zeros_like(p) for p in muon_p}
