@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- ARC-AGI-1 v5.0.0 : Object-Aware D4xS9 Equivariant ELBO + Shape-Routed MDL
+ ARC-AGI-1 v5.0.3 : Fixed-Noise Object-Aware D4xS9 Equivariant ELBO + Shape Router
 ================================================================================
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from core import SelfAttnSet
 
-__version__ = "5.0.2"
+__version__ = "5.0.3"
 ARC_ZIP_URL = "https://github.com/fchollet/ARC-AGI/archive/refs/heads/master.zip"
 
 
@@ -43,7 +43,6 @@ def _hw_cache(H: int, W: int, dev_str: str):
 
 
 def extract_object_features(grid_2d: np.ndarray) -> np.ndarray:
-    """Real per-cell neighbor + BFS connected-component object features: (H*W, 9)."""
     H, W = grid_2d.shape; N = H * W
     feats = np.zeros((H, W, 9), dtype=np.float32)
     for r in range(H):
@@ -153,7 +152,9 @@ class ARCCompNet(nn.Module):
         super().__init__()
         self.Win = nn.Linear(16, C)
         self.color_bias = nn.Parameter(torch.zeros(10, C))
-        self.mu_proj = nn.Linear(C, C); self.lv_proj = nn.Linear(C, C)
+        self.mu_proj = nn.Linear(C, C)
+        self.lv_proj = nn.Linear(C, C)
+        nn.init.constant_(self.lv_proj.bias, -5.0)  # small initial std ~0.08 (not 1.0!)
         self.blocks = nn.ModuleList([FastARCBlock(C, heads) for _ in range(L)])
         self.lnf = nn.LayerNorm(C, eps=1e-5)
         self.pix_head = nn.Linear(C, 1)
@@ -171,13 +172,15 @@ class ARCCompNet(nn.Module):
         return torch.cat([in_oh.unsqueeze(-1), is_z.unsqueeze(-1), hist.unsqueeze(-1),
                           ob.unsqueeze(2).expand(B, N, 10, 9), coords.view(1, N, 1, 4).expand(B, N, 10, 4)], dim=-1)
 
-    def forward(self, f, H: int, W: int, sample_z=True):
+    def forward(self, f, H: int, W: int, T=2, sample_z=True):
         h0 = F.gelu(self.Win(f)) + self.color_bias.view(1, 1, 10, -1)
-        mu = self.mu_proj(h0); lv = self.lv_proj(h0).clamp(-8.0, 2.0)
+        mu = self.mu_proj(h0); lv = self.lv_proj(h0).clamp(-8.0, -3.0)
         kl = -0.5 * (1.0 + lv - mu.pow(2) - lv.exp()).mean()
         h = (mu + torch.randn_like(mu) * torch.exp(0.5 * lv)) if (sample_z and self.training) else mu
-        for blk in self.blocks:
-            h = blk(h, H, W)
+        for _ in range(T):
+            h = 0.5 * h + 0.5 * h0
+            for blk in self.blocks:
+                h = blk(h, H, W)
         z = self.lnf(h)
         return self.pix_head(z).squeeze(-1), self.crop_head(z.mean(2)).squeeze(-1), z, kl
 
@@ -201,7 +204,7 @@ def inv_d4(g, k_rot: int, flip: bool):
     return a.copy()
 
 
-def run_single_view(task, k_rot: int, flip: bool, device, steps=120, C=32, L=2):
+def run_single_view(task, k_rot: int, flip: bool, device, steps=140, C=32, L=2):
     demos = [{"input": apply_d4(d["input"], k_rot, flip), "output": apply_d4(d["output"], k_rot, flip)} for d in task["train"]]
     test_in = apply_d4(task["test"][0]["input"], k_rot, flip)
     mode, param, crop_masks = detect_task_mode(demos)
@@ -222,13 +225,13 @@ def run_single_view(task, k_rot: int, flip: bool, device, steps=120, C=32, L=2):
         f_b = net.build_features([x[0] for x in lst], [x[1] for x in lst], device).detach()
         groups.append((hw[0], hw[1], f_b, lst))
 
-    opt = torch.optim.AdamW(net.parameters(), lr=1.2e-2, weight_decay=0.02)
+    opt = torch.optim.AdamW(net.parameters(), lr=1.5e-2, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
     net.train(); demos_fit = False
     for st in range(steps):
         opt.zero_grad(); tot_l = 0.0; all_ok = True
         for Hi, Wi, f_b, lst in groups:
-            pix_lg, crop_lg, z, kl = net(f_b, Hi, Wi, sample_z=(st < steps - 15))
+            pix_lg, crop_lg, z, kl = net(f_b, Hi, Wi, T=2, sample_z=(st < steps - 40))
             if mode in ("SAME_HW", "INT_SCALE"):
                 ygt = torch.stack([x[2] for x in lst])
                 loss_g = F.cross_entropy(pix_lg.reshape(-1, 10), ygt.reshape(-1))
@@ -245,17 +248,17 @@ def run_single_view(task, k_rot: int, flip: bool, device, steps=120, C=32, L=2):
                     ygt_i = item[2].unsqueeze(0)
                     loss_g = loss_g + F.cross_entropy(glg.reshape(-1, 10), ygt_i.reshape(-1)) / len(lst)
                     all_ok &= bool((glg.argmax(-1) == ygt_i).all())
-            tot_l = tot_l + (loss_g + 0.015 * kl) / len(groups)
+            tot_l = tot_l + (loss_g + 0.002 * kl) / len(groups)
         tot_l.backward(); opt.step(); sched.step()
         if all_ok:
             demos_fit = True
-            if st >= 60: break
+            if st >= 80: break
 
     net.eval()
     with torch.no_grad():
         ti_use = np.repeat(np.repeat(test_in, param[0], axis=0), param[1], axis=1) if mode == "INT_SCALE" else test_in
         f_t = net.build_features([ti_use], [extract_object_features(ti_use)], device)
-        pix_t, crop_t, z_t, _ = net(f_t, ti_use.shape[0], ti_use.shape[1], sample_z=False)
+        pix_t, crop_t, z_t, _ = net(f_t, ti_use.shape[0], ti_use.shape[1], T=2, sample_z=False)
         if mode in ("SAME_HW", "INT_SCALE"):
             pred = pix_t[0].argmax(-1).cpu().numpy().reshape(ti_use.shape)
         elif mode == "CROP":
@@ -269,7 +272,7 @@ def run_single_view(task, k_rot: int, flip: bool, device, steps=120, C=32, L=2):
     return inv_d4(pred, k_rot, flip), demos_fit
 
 
-def solve_task(task, device, steps=120):
+def solve_task(task, device, steps=140):
     fit_cands, all_cands = {}, {}; any_fit = False
     for k_rot in range(2):
         pred, d_fit = run_single_view(task, k_rot, False, device, steps=steps)
@@ -288,8 +291,8 @@ def solve_task(task, device, steps=120):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", type=int, default=25)
-    ap.add_argument("--steps", type=int, default=100)
-    ap.add_argument("--out", default="runs/arc_v5")
+    ap.add_argument("--steps", type=int, default=140)
+    ap.add_argument("--out", default="runs/arc_v53")
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
@@ -299,7 +302,7 @@ def main():
     t_b = time.time()
     for tid in keys[:2]: solve_task(eval_tasks[tid], dev, steps=args.steps)
     sec_per_task = (time.time() - t_b) / 2.0
-    print(f"ARC-AGI-1 v5.0.0 | Measured speed: {sec_per_task:.2f}s/task (est ~{sec_per_task*len(keys)/60:.1f} min for {len(keys)} tasks) | {dev}", flush=True)
+    print(f"ARC-AGI-1 v{__version__} | Measured speed: {sec_per_task:.2f}s/task (est ~{sec_per_task*len(keys)/60:.1f} min for {len(keys)} tasks) | {dev}", flush=True)
 
     p1 = p2 = fit_cnt = 0; t0 = time.time(); solved_ids = []
     for i, tid in enumerate(keys):
@@ -315,7 +318,7 @@ def main():
 
     print(f"\n[FINAL WITHOUT PRETRAINING] n={len(keys)} | pass@1={p1/len(keys)*100:.2f}% | pass@2={p2/len(keys)*100:.2f}% ({p2}/{len(keys)}) | demos_fit={fit_cnt}/{len(keys)}", flush=True)
     print(f"   Solved IDs: {solved_ids}", flush=True)
-    (out / "arc_v5_results.json").write_text(json.dumps(dict(n=len(keys), pass1=p1/len(keys), pass2=p2/len(keys), demos_fit=fit_cnt, solved_ids=solved_ids), indent=2))
+    (out / "arc_v53_results.json").write_text(json.dumps(dict(n=len(keys), pass1=p1/len(keys), pass2=p2/len(keys), demos_fit=fit_cnt, solved_ids=solved_ids), indent=2))
 
 
 if __name__ == "__main__":
